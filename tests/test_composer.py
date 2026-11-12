@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from ideagraph_composer import Runner, api, choose, maps
+from idea_graph_composer import Runner, api, choose, maps
 
 PACKAGES = {
     "clarify": {"id": "clarify", "name": "Уточнение", "kind": "agent", "outcomes": ["готово"],
@@ -19,7 +19,7 @@ PACKAGES = {
 
 @pytest.fixture(autouse=True)
 def home(tmp_path, monkeypatch):
-    monkeypatch.setenv("IDEAGRAPH_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("IDEA_GRAPH_HOME", str(tmp_path / "home"))
 
 
 def test_default_map_and_storage():
@@ -67,7 +67,7 @@ class Host:
     """Вместо оболочки: пакеты заканчивают работу сразу с заданными итогами."""
 
     def __init__(self, tmp_path, outcomes):
-        self.dir = tmp_path / ".ideagraph"
+        self.dir = tmp_path / ".idea-graph"
         self.folder = tmp_path
         self.outcomes = {key: list(value) for key, value in outcomes.items()}
         self.started = []

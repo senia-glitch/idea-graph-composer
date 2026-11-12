@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ideagraph-composer"
+name = "idea-graph-composer"
 version = "0.1.0"
 description = "Компоновщик: карта пакетов и прогон по ней"
 readme = "README.md"
@@ -13,14 +13,14 @@ dependencies = []
 [project.optional-dependencies]
 test = ["pytest"]
 
-[project.entry-points."ideagraph.packages"]
-composer = "ideagraph_composer:manifest"
+[project.entry-points."idea_graph.packages"]
+composer = "idea_graph_composer:manifest"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-ideagraph_composer = ["*.md", "static/*"]
+idea_graph_composer = ["*.md", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

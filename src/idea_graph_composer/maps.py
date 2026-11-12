@@ -1,6 +1,6 @@
 """Карта пакетов: хранение, проверка и карта по умолчанию.
 
-Карта — шаблон, общий для всех идей: лежит в домашней папке (``~/.ideagraph/maps``).
+Карта — шаблон, общий для всех идей: лежит в домашней папке (``~/.idea-graph/maps``).
 Узел — установленный пакет, стрелка — «после этого запускать то» с условием по итогу пакета.
 """
 
@@ -18,7 +18,7 @@ ROOT_KINDS = {"идея"}
 
 
 def maps_dir() -> Path:
-    return Path(os.environ.get("IDEAGRAPH_HOME") or Path.home() / ".ideagraph") / "maps"
+    return Path(os.environ.get("IDEA_GRAPH_HOME") or Path.home() / ".idea-graph") / "maps"
 
 
 def clean(raw: dict) -> dict:

@@ -64,13 +64,20 @@ class StageState:
             data = {}
         self.steps: dict = data.get("steps") or {}
         self.stale: dict = data.get("stale") or {}
+        self.skipped: bool = bool(data.get("skipped"))
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps({"steps": self.steps, "stale": self.stale}, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
+        tmp.write_text(json.dumps({"steps": self.steps, "stale": self.stale, "skipped": self.skipped},
+                                  ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, self.path)
+
+    def entry(self, step_id: str) -> dict:
+        return self.steps.setdefault(step_id, {"status": STATUS_OPEN})
+
+    def runs(self, step_id: str) -> int:
+        return int((self.steps.get(step_id) or {}).get("runs") or 0)
 
     def status(self, step_id: str) -> str:
         return (self.steps.get(step_id) or {}).get("status") or STATUS_OPEN
@@ -95,8 +102,52 @@ def _requirement(project, step: dict) -> tuple[bool, int, int]:
     return count >= minimum, count, minimum
 
 
+def _link_parent(store, card_id: str) -> dict | None:
+    for edge in store.edges.values():
+        if edge["kind"] == "детализирует" and edge["from"] == card_id:
+            return store.cards.get(edge["to"])
+    return None
+
+
+def issues(project, manifest: dict, step: dict, state: StageState) -> list[dict]:
+    """Открытые вопросы шага: что ещё можно улучшить (непринятое, пробелы, замечания, устаревшее, правки)."""
+    store = project.store
+    out: list[dict] = []
+    cards = _cards_of(store, step["produces"])
+    proposed = [c for c in cards if c["status"] == PROPOSED]
+    if proposed:
+        out.append({"type": "pending", "text": f"Не принято карточек: {len(proposed)}"})
+    bank_name = step.get("produces_bank")
+    if bank_name:
+        waiting = [r for r in store.bank(bank_name).list() if (r.get("data") or {}).get("state") == "proposed"]
+        if waiting:
+            out.append({"type": "pending", "text": f"Не принято записей банка: {len(waiting)}"})
+    stale = state.stale.get(step["id"])
+    if stale:
+        out.append({"type": "stale", "text": stale["reason"]})
+    for card in sorted(_cards_of(store, ["замечание"]), key=lambda c: int(c["id"][1:])):
+        parent = _link_parent(store, card["id"])
+        belongs = (card.get("attrs") or {}).get("step") == step["id"] or (
+            parent is not None and parent["kind"] in step["produces"] and not (card.get("attrs") or {}).get("step"))
+        if belongs:
+            out.append({"type": "remark", "text": card["title"], "card": card["id"]})
+    for card in sorted(_cards_of(store, ["правка"]), key=lambda c: int(c["id"][1:])):
+        target = store.cards.get(str((card.get("attrs") or {}).get("target")))
+        if target is not None and target["kind"] in step["produces"]:
+            out.append({"type": "proposal", "text": f"Предложена правка к «{target['title']}»", "card": card["id"]})
+    check = step.get("checks")
+    if callable(check):
+        from .runtime import PackageContext
+        try:
+            for text in check(PackageContext(project, manifest["id"]), step) or []:
+                out.append({"type": "check", "text": str(text)})
+        except Exception as error:  # noqa: BLE001 — сломанная проверка пакета не должна ронять интерфейс
+            out.append({"type": "check", "text": f"Проверка шага не сработала: {error}"})
+    return out
+
+
 def describe(project, manifest: dict) -> dict:
-    """Состояние шагов для интерфейса: статус, устаревание, сколько карточек и записей банка."""
+    """Состояние шагов для интерфейса: статус, число прогонов, открытые вопросы, сколько карточек и записей банка."""
     state = StageState(project, manifest["id"])
     out = []
     for step in steps_of(manifest):
@@ -104,8 +155,9 @@ def describe(project, manifest: dict) -> dict:
         item = {
             "id": step["id"], "status": state.status(step["id"]),
             "ts": (state.steps.get(step["id"]) or {}).get("ts"),
-            "stale": state.stale.get(step["id"]),
+            "stale": state.stale.get(step["id"]), "runs": state.runs(step["id"]),
             "cards": len(cards), "proposed": sum(1 for c in cards if c["status"] == PROPOSED),
+            "issues": issues(project, manifest, step, state),
         }
         if step.get("requires"):
             ok, count, minimum = _requirement(project, step)
@@ -116,7 +168,24 @@ def describe(project, manifest: dict) -> dict:
             item["records"] = len(records)
             item["records_proposed"] = sum(1 for r in records if (r.get("data") or {}).get("state") == "proposed")
         out.append(item)
-    return {"package": manifest["id"], "steps": out}
+    return {"package": manifest["id"], "skipped": state.skipped, "steps": out}
+
+
+def bump_runs(project, manifest: dict, step_id: str) -> None:
+    """Ещё один прогон шага (любое действие помощника): показывается в карте, чтобы было видно, сколько раз шаг улучшали."""
+    state = StageState(project, manifest["id"])
+    entry = state.entry(step_id)
+    entry["runs"] = int(entry.get("runs") or 0) + 1
+    state.save()
+
+
+def set_skipped(project, manifest: dict, flag: bool) -> dict:
+    """Часть этапа можно пропустить целиком (например, «Разведку»): пропущенное не считается незавершённым."""
+    state = StageState(project, manifest["id"])
+    state.skipped = bool(flag)
+    state.save()
+    project._touch()
+    return describe(project, manifest)
 
 
 def approve(project, manifest: dict, step_id: str, accept_all: bool = False) -> dict:
@@ -147,7 +216,8 @@ def approve(project, manifest: dict, step_id: str, accept_all: bool = False) -> 
             data = dict(record["data"])
             data["state"] = "accepted"
             bank.update(record["id"], HUMAN, data=data)
-    state.steps[step_id] = {"status": STATUS_APPROVED, "ts": time.time()}
+    entry = state.entry(step_id)
+    entry.update({"status": STATUS_APPROVED, "ts": time.time()})
     state.stale.pop(step_id, None)
     state.save()
     project._touch()
@@ -157,7 +227,7 @@ def approve(project, manifest: dict, step_id: str, accept_all: bool = False) -> 
 def reopen(project, manifest: dict, step_id: str) -> dict:
     step_by_id(manifest, step_id)
     state = StageState(project, manifest["id"])
-    state.steps[step_id] = {"status": STATUS_OPEN, "ts": time.time()}
+    state.entry(step_id).update({"status": STATUS_OPEN, "ts": time.time()})
     state.save()
     project._touch()
     return describe(project, manifest)
@@ -170,6 +240,14 @@ def clear_stale(project, manifest: dict, step_id: str) -> dict:
     state.save()
     project._touch()
     return describe(project, manifest)
+
+
+def _started(project, manifest: dict, state: StageState, step_id: str) -> bool:
+    """Есть ли у шага результат (карточки, записи банка) или он уже утверждён."""
+    step = step_by_id(manifest, step_id)
+    if state.status(step_id) == STATUS_APPROVED or _cards_of(project.store, step["produces"]):
+        return True
+    return bool(step.get("produces_bank") and project.store.bank(step["produces_bank"]).list())
 
 
 def mark_changes(project, manifest: dict, changes: list[dict]) -> list[str]:
@@ -190,6 +268,8 @@ def mark_changes(project, manifest: dict, changes: list[dict]) -> list[str]:
             continue
         what = "удалена" if after is None else "изменена"
         for target in downstream(manifest, step["id"]):
+            if not _started(project, manifest, state, target):
+                continue                                  # зависимый шаг ещё пуст: пересматривать нечего
             entry = state.stale.setdefault(target, {"reason": "", "rev": 0, "cards": []})
             entry["rev"] = project.store.revision
             if before["id"] not in entry["cards"]:

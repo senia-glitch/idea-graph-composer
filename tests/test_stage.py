@@ -126,6 +126,7 @@ def test_editing_approved_step_marks_downstream_stale_and_agent_proposes_edits(m
 def test_status_only_and_unapproved_changes_do_not_mark_stale(make):
     project = make(quiet, stage=True)
     role = add(project, "роль", "Врач", status="proposed")
+    add(project, "сценарий", "Приём")
     project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])      # шаг не утверждён
     project.approve_step("st", "roles", accept_all=True)
     project.human_ops([{"op": "update_card", "id": role, "body": "тот же шаг без смены названия", "status": "accepted"}])
@@ -141,6 +142,7 @@ def test_auto_propagate_can_be_switched_off_and_skips_busy_package(make):
     project = make(quiet, stage=True)
     project.settings.data["auto_propagate"] = False
     role = add(project, "роль", "Врач")
+    add(project, "сценарий", "Приём")
     project.approve_step("st", "roles")
     project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])
     time.sleep(0.3)
@@ -155,6 +157,18 @@ def test_auto_propagate_can_be_switched_off_and_skips_busy_package(make):
     project.human_ops([{"op": "update_card", "id": role, "title": "Лор"}])
     time.sleep(0.3)
     assert project.runs["st"].role == ""                                  # правок не запускали: идёт диалог
+
+
+def test_empty_dependent_steps_are_not_marked_stale(make):
+    project = make(quiet, stage=True)
+    project.settings.data["auto_propagate"] = False
+    role = add(project, "роль", "Врач")
+    project.approve_step("st", "roles")
+    project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])
+    assert steps(project)["scen"]["stale"] is None                        # у сценариев ещё ничего нет
+    add(project, "сценарий", "Приём")
+    project.human_ops([{"op": "update_card", "id": role, "title": "Лор"}])
+    assert steps(project)["scen"]["stale"] is not None
 
 
 def test_apply_proposal_validation(make):

@@ -232,7 +232,7 @@ class Project:
         return card
 
     def start(self, package_id: str, fresh: bool = False, auto: dict | None = None, step: str | None = None,
-              action: str | None = None, target: str | None = None) -> dict:
+              action: str | None = None, target: str | None = None, goal: str = "") -> dict:
         """Запустить пакет, помощника шага или автоматический режим.
 
         * без ``step``/``auto`` — продолжить диалог пакета с человеком;
@@ -240,6 +240,8 @@ class Project:
           ``action="propagate"`` — предложить правки зависимого после изменения утверждённого шага;
         * ``auto={"targets": [id, …]}`` — автоматический режим: вопросов человеку нет, на развилках решает совет;
           цели — карточки верхнего уровня этапа (пусто — все). Нужна хотя бы одна.
+
+        ``goal`` — необязательное «что улучшить» от человека; шаг с готовым результатом улучшается, а не делается заново.
         """
         manifest = self._manifest(package_id)
         if manifest["kind"] != "agent":
@@ -290,11 +292,13 @@ class Project:
             elif action == "propagate":
                 run.inbox.append(self._propagate_text(manifest))
             elif step_def:
-                run.inbox.append(self._action_text(manifest, step_def, action, target_card))
+                run.inbox.append(self._action_text(manifest, step_def, action, target_card, str(goal or "").strip()[:2000]))
             elif run.question is None and not run.inbox:
                 run.inbox.append("Начало работы пакета." if run.turn == 0 else "Человек попросил продолжить работу.")
             run.status = "running"
             self._touch(run)
+        if step_def:
+            stage.bump_runs(self, manifest, step_def["id"])
         label = (" (автоматически)" if auto_info else f" — {ACTIONS[action]}" if action else "")
         self.say("system", f"Запущен пакет «{manifest['name']}»{label}"
                  + (f", шаг «{step_def['title']}»" if step_def else ""), package_id, "start")
@@ -319,7 +323,25 @@ class Project:
         return {"targets": [c["id"] for c in targets], "research": research, "pos": 0,
                 "queue": [[c["id"], s] for c in targets for s in steps]}
 
-    def _action_text(self, manifest: dict, step: dict, action: str, target: dict | None) -> str:
+    def _improve_text(self, manifest: dict, step: dict, goal: str) -> str:
+        """Вводные «улучшения»: что уже есть у шага, что открыто и что просит человек. Пусто, если шаг ещё не начат и цели нет."""
+        state = stage.StageState(self, manifest["id"])
+        cards = [c for c in self.store.cards.values() if c["kind"] in step["produces"]]
+        records = self.store.bank(step["produces_bank"]).list() if step.get("produces_bank") else []
+        lines = []
+        if goal:
+            lines.append(f"ЧТО УЛУЧШИТЬ (задача человека): {goal}")
+        if cards or records:
+            lines.append("У шага уже есть результат, поэтому это УЛУЧШЕНИЕ, а не создание заново: прочитай существующее (graph_read, "
+                         "bank_read), не дублируй, добавляй недостающее и согласуй с соседними шагами. Карточки человека и принятые "
+                         "карточки не правь и не удаляй: предлагай карточку «правка» (attrs: target — id карточки, field — title или "
+                         "body, new — новое значение целиком, reason — короткая причина). Свои непринятые карточки переписывать можно.")
+        found = stage.issues(self, manifest, step, state)
+        if found and (cards or records):
+            lines.append("Открытые вопросы шага: " + "; ".join(i["text"] for i in found[:12]) + ".")
+        return "\n".join(lines)
+
+    def _action_text(self, manifest: dict, step: dict, action: str, target: dict | None, goal: str = "") -> str:
         prompt = step["prompts"][action]
         ctx = PackageContext(self, manifest["id"])
         text = prompt(ctx, step, target) if callable(prompt) else str(prompt)
@@ -327,6 +349,10 @@ class Project:
                 f"Действие: {ACTIONS[action]}."]
         if target:
             head.append(f"Цель: карточка {target['id']} «{target['title']}».")
+        if action != "review":
+            improve = self._improve_text(manifest, step, goal)
+            if improve:
+                head.append(improve)
         return "\n".join(head) + "\n" + text
 
     def _propagate_text(self, manifest: dict) -> str:
@@ -521,6 +547,7 @@ class Project:
         target = self.store.cards.get(card_id)
         with self.lock:
             run.step, run.action = step_id, "suggest"
+            stage.bump_runs(self, manifest, step_id)
             if pos == 0:
                 spec = manifest["stage"]["auto"]
                 targets = [self.store.cards[i] for i in run.autorun["targets"] if i in self.store.cards]
@@ -863,6 +890,9 @@ class Project:
     def clear_stale(self, package_id: str, step_id: str) -> dict:
         return self._stage_call(stage.clear_stale, package_id, step_id)
 
+    def skip_stage(self, package_id: str, skipped: bool) -> dict:
+        return self._stage_call(stage.set_skipped, package_id, bool(skipped))
+
     def _stage_call(self, function, package_id: str, *args) -> dict:
         try:
             return function(self, self._stage_manifest(package_id), *args)
@@ -993,7 +1023,15 @@ class Project:
             raise EngineError("invalid_ops", "ops должен быть списком объектов")
         ops = copy.deepcopy(ops)
         allowed = ROLE_KINDS.get(run.role)
+        improving = (run.step or run.autorun) and not run.role
         for op in ops:
+            if improving and isinstance(op, dict) and op.get("op") in ("update_card", "delete_card"):
+                card = self.store.cards.get(str(op.get("id")))
+                if card is not None and (card["author"] == HUMAN or card["status"] == "accepted"):
+                    raise EngineError("improve_limit", f"Карточку {card['id']} правишь не ты: она создана человеком или принята. "
+                                      "Предложи карточку «правка» (attrs: target, field, new, reason)")
+            if run.role == "reviewer" and isinstance(op, dict) and op.get("op") == "add_card" and run.step:
+                op["attrs"] = {**(op.get("attrs") or {}), "step": run.step}
             if allowed is not None:
                 ok = isinstance(op, dict) and (op.get("op") == "add_edge" or (
                     op.get("op") == "add_card" and op.get("kind") in allowed))

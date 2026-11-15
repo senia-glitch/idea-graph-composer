@@ -85,7 +85,7 @@ def normalize(raw: dict) -> dict:
 def _public_stage(stage: dict) -> dict:
     steps = []
     for step in stage["steps"]:
-        item = {k: step[k] for k in ("id", "title", "question", "produces", "needs") if k in step}
+        item = {k: step[k] for k in ("id", "title", "question", "help", "produces", "needs") if k in step}
         item["actions"] = [a for a in ("suggest", "review", "clarify", "generate") if step["prompts"].get(a)]
         for key in ("produces_bank", "visual", "bank", "target_kind", "requires"):
             if step.get(key):

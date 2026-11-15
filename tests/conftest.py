@@ -57,16 +57,19 @@ def stage_manifest(**over):
     manifest = {
         "id": "st", "name": "Этап", "kind": "agent", "skill": "Строй.", "outcomes": ["готово", "есть_пробелы"],
         "banks": {"reads": ["comp"], "writes": ["comp"]},
+        "document": lambda ctx: "## Роли\n" + "\n".join(f"- {c['title']}" for c in ctx.store.cards.values() if c["kind"] == "роль"),
         "stage": {
             "roots": "сфера", "hidden_edges": ["участвует"], "kinds": [{"kind": "роль", "title": "Роль"}],
             "steps": [
                 {"id": "roles", "title": "Роли", "question": "Кто участвует?", "produces": ["роль"], "needs": [],
+                 "phase": "Процессы", "label": "Предложить роли",
                  "prompts": {"suggest": "ПРЕДЛОЖИ-РОЛИ", "review": "ПРОВЕРЬ-РОЛИ",
                              "clarify": lambda ctx, step, target: "УТОЧНИ " + (target["title"] if target else "-")}},
                 {"id": "scen", "title": "Сценарии", "question": "Что делают?", "produces": ["сценарий"],
-                 "needs": ["roles"], "prompts": {"suggest": "ПРЕДЛОЖИ-СЦЕНАРИИ"}},
+                 "needs": ["roles"], "phase": "Процессы", "label": "Предложить сценарии",
+                 "prompts": {"suggest": "ПРЕДЛОЖИ-СЦЕНАРИИ", "review": "ПРОВЕРЬ-СЦЕНАРИИ"}},
                 {"id": "comp", "title": "Конкуренты", "question": "Кто конкурент?", "produces": [], "needs": [],
-                 "produces_bank": "comp", "research": True,
+                 "produces_bank": "comp", "research": True, "phase": "Разведка", "label": "Найти конкурентов",
                  "prompts": {"suggest": "ПРЕДЛОЖИ-КОНКУРЕНТОВ"}},
             ],
             "auto": {"targets": "сфера", "limits": [{"key": "n", "name": "Сколько", "default": 3}],

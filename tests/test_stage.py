@@ -1,4 +1,4 @@
-"""Карта этапа: ворота, устаревание, помощник шага, ревью, правки зависимого, автоматическая очередь."""
+"""Этапы: действия помощника, ревью, правки зависимого после ваших изменений, автоматическая очередь."""
 
 import time
 
@@ -54,123 +54,6 @@ def test_downstream_order():
 
 # ---------------------------------------------------------------------- ворота
 
-def test_gates_approve_reopen_and_pending_cards(make):
-    project = make(quiet, stage=True)
-    with pytest.raises(EngineError) as info:
-        project.approve_step("st", "roles")
-    assert info.value.code == "empty_step"
-    role = add(project, "роль", "Врач", status="proposed")
-    assert steps(project)["roles"]["cards"] == 1 and steps(project)["roles"]["proposed"] == 1
-    with pytest.raises(EngineError) as info:
-        project.approve_step("st", "roles")
-    assert info.value.code == "pending"
-    project.approve_step("st", "roles", accept_all=True)
-    assert project.store.cards[role]["status"] == "accepted" and steps(project)["roles"]["status"] == "approved"
-    assert steps(project)["scen"]["status"] == "open"
-    project.reopen_step("st", "roles")
-    assert steps(project)["roles"]["status"] == "open"
-    with pytest.raises(EngineError):
-        project.approve_step("st", "нет-шага")
-    with pytest.raises(EngineError):
-        project.approve_step("clarify", "x")
-
-
-def test_bank_step_gate_accepts_proposed_records(make):
-    project = make(quiet, stage=True)
-    bank = project.store.bank("comp")
-    bank.put("competitor", {"name": "Докдок", "state": "proposed"}, "package:st")
-    assert steps(project)["comp"]["records"] == 1 and steps(project)["comp"]["records_proposed"] == 1
-    with pytest.raises(EngineError):
-        project.approve_step("st", "comp")
-    project.approve_step("st", "comp", accept_all=True)
-    assert bank.list()[0]["data"]["state"] == "accepted" and steps(project)["comp"]["status"] == "approved"
-
-
-# ---------------------------------------------------------------------- устаревание и правки зависимого
-
-def test_editing_approved_step_marks_downstream_stale_and_agent_proposes_edits(make):
-    seen = {"notes": [], "denied": []}
-
-    def script(note, call, request):
-        seen["notes"].append(note)
-        seen["denied"].append(call("graph_apply", ops=[{"op": "update_card", "id": "c2", "title": "взлом"}]))
-        seen["denied"].append(call("ask", question="?", options=["а", "б"]))
-        call("graph_apply", ops=[{"op": "add_card", "kind": "правка", "title": "Правка: Сценарий записи",
-                                  "body": "Поменять роль", "status": "proposed",
-                                  "attrs": {"target": scenario, "field": "title", "new": "Сценарий записи у терапевта",
-                                            "reason": "роль переименована"}}])
-        call("finish", outcome="готово", summary="предложил правку")
-        return ""
-
-    project = make(script, stage=True)
-    role = add(project, "роль", "Врач")
-    scenario = add(project, "сценарий", "Сценарий записи")
-    project.approve_step("st", "roles")
-    project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])
-    assert steps(project)["scen"]["stale"]["cards"] == [role] and steps(project)["roles"]["stale"] is None
-    assert "Терапевт" not in steps(project)["scen"]["stale"]["reason"] and "Врач" in steps(project)["scen"]["stale"]["reason"]
-    run = wait_for(lambda: project.runs.get("st"), ("finished", "error"))
-    assert run.status == "finished" and run.role == "proposer"
-    assert "Человек изменил утверждённые карточки" in seen["notes"][0] and "Сценарии" in seen["notes"][0]
-    assert seen["denied"][0].startswith("ОТКАЗ role_limit") and seen["denied"][1].startswith("ОТКАЗ unknown_tool")
-    proposal = next(c for c in project.store.cards.values() if c["kind"] == "правка")
-    assert proposal["status"] == "proposed" and proposal["author"] == "package:st"
-    project.apply_proposal(proposal["id"])
-    assert project.store.cards[scenario]["title"] == "Сценарий записи у терапевта"
-    assert proposal["id"] not in project.store.cards
-    project.approve_step("st", "scen")                                     # утверждение снимает отметку
-    assert steps(project)["scen"]["stale"] is None
-    project.clear_stale("st", "scen")
-
-
-def test_status_only_and_unapproved_changes_do_not_mark_stale(make):
-    project = make(quiet, stage=True)
-    role = add(project, "роль", "Врач", status="proposed")
-    add(project, "сценарий", "Приём")
-    project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])      # шаг не утверждён
-    project.approve_step("st", "roles", accept_all=True)
-    project.human_ops([{"op": "update_card", "id": role, "body": "тот же шаг без смены названия", "status": "accepted"}])
-    assert steps(project)["scen"]["stale"] is not None                                # тело изменено — отметка есть
-    project.clear_stale("st", "scen")
-    project.human_ops([{"op": "update_card", "id": role, "status": "accepted"}])      # то же самое: ничего нового
-    assert steps(project)["scen"]["stale"] is None
-    project.human_ops([{"op": "delete_card", "id": role}])
-    assert "удалена" in steps(project)["scen"]["stale"]["reason"]
-
-
-def test_auto_propagate_can_be_switched_off_and_skips_busy_package(make):
-    project = make(quiet, stage=True)
-    project.settings.data["auto_propagate"] = False
-    role = add(project, "роль", "Врач")
-    add(project, "сценарий", "Приём")
-    project.approve_step("st", "roles")
-    project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])
-    time.sleep(0.3)
-    assert "st" not in project.runs and steps(project)["scen"]["stale"] is not None
-    project.settings.data["auto_propagate"] = True
-    project.clear_stale("st", "scen")
-    project.start("st", fresh=True)                                      # диалог: ждёт ответа на вопрос
-    from idea_graph_engine.runtime import Run
-    project.runs["st"].question = {"id": "q", "question": "?", "options": [{"title": "а"}, {"title": "б"}]}
-    project.runs["st"].status = "asking"
-    wait_for(lambda: project.runs["st"], ("asking", "finished", "idle"))
-    project.human_ops([{"op": "update_card", "id": role, "title": "Лор"}])
-    time.sleep(0.3)
-    assert project.runs["st"].role == ""                                  # правок не запускали: идёт диалог
-
-
-def test_empty_dependent_steps_are_not_marked_stale(make):
-    project = make(quiet, stage=True)
-    project.settings.data["auto_propagate"] = False
-    role = add(project, "роль", "Врач")
-    project.approve_step("st", "roles")
-    project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])
-    assert steps(project)["scen"]["stale"] is None                        # у сценариев ещё ничего нет
-    add(project, "сценарий", "Приём")
-    project.human_ops([{"op": "update_card", "id": role, "title": "Лор"}])
-    assert steps(project)["scen"]["stale"] is not None
-
-
 def test_apply_proposal_validation(make):
     project = make(quiet, stage=True)
     plain = add(project, "роль", "Врач")
@@ -207,7 +90,7 @@ def test_suggest_and_clarify_notes_and_errors(make):
     wait_for(lambda: project.runs["st"], ("finished",))
     assert "УТОЧНИ Врач" in notes[1][1] and f"Цель: карточка {role}" in notes[1][1]
     with pytest.raises(EngineError) as info:
-        project.start("st", step="scen", action="review")
+        project.start("st", step="scen", action="clarify")
     assert info.value.code == "no_action"
     for kwargs in ({"step": "roles", "action": "магия"}, {"action": "suggest"}, {"step": "нет", "action": "suggest"},
                    {"step": "roles", "target": "c99"}):
@@ -307,17 +190,3 @@ def test_auto_validation(make):
         project.start("clarify", auto={"targets": []})
     assert info.value.code == "no_auto"
 
-
-def test_step_with_requirement_instead_of_own_cards(make):
-    project = make(quiet, stage=True)
-    manifest = project.registry.get("st")
-    manifest["stage"]["steps"][1]["requires"] = {"kind": "сценарий", "field": "Автоматизировать", "value": "да", "min": 1}
-    scenario = add(project, "сценарий", "Запись", body="Автоматизировать: нет")
-    assert steps(project)["scen"]["required"] == {"ok": False, "count": 0, "min": 1}
-    with pytest.raises(EngineError) as info:
-        project.approve_step("st", "scen")
-    assert info.value.code == "empty_step" and "Автоматизировать: да" in info.value.message
-    project.human_ops([{"op": "update_card", "id": scenario, "body": "Автоматизировать: нет\nАвтоматизировать: Да."}])
-    assert steps(project)["scen"]["required"]["ok"] is True
-    project.approve_step("st", "scen")
-    assert steps(project)["scen"]["status"] == "approved"

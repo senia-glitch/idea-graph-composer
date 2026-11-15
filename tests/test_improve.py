@@ -44,48 +44,12 @@ def test_goal_and_existing_result_turn_a_run_into_an_improvement(make):
     assert "УЛУЧШЕНИЕ" not in notes[2] and "ПРОВЕРЬ-РОЛИ" in notes[2]
 
 
-def test_run_counter_and_status_survive_approval(make):
-    project = make(lambda note, call, request: call("finish", outcome="готово", summary="ок") and "", stage=True)
-    add(project, "роль", "Пациент")
-    for _ in range(3):
-        project.start("st", step="roles", action="suggest")
-        wait_for(lambda: project.runs["st"], ("finished",))
-    assert step_state(project, "roles")["runs"] == 3 and step_state(project, "scen")["runs"] == 0
-    project.approve_step("st", "roles")
-    project.reopen_step("st", "roles")
-    assert step_state(project, "roles")["runs"] == 3                       # утверждение и снятие счётчик не сбрасывают
-
-
 def test_auto_counts_each_step_once(make):
     project = make(lambda note, call, request: call("finish", outcome="готово", summary="ок") and "", stage=True)
     add(project, "сфера", "Клиники")
     project.start("st", auto={"targets": [], "research": False})
     wait_for(lambda: project.runs["st"], ("finished",), timeout=15)
     assert [step_state(project, s)["runs"] for s in ("roles", "scen", "comp")] == [1, 1, 1]
-
-
-def test_open_issues_collect_pending_remarks_proposals_stale_and_checks(make):
-    project = make(lambda note, call, request: "", stage=True)
-    with_checks(project)
-    role = add(project, "роль", "Врач")
-    scenario = add(project, "сценарий", "Приём", status="proposed")
-    project.approve_step("st", "roles")
-    project.human_ops([{"op": "update_card", "id": role, "title": "Терапевт"}])
-    add(project, "замечание", "Нет роли «Регистратор»", status="proposed", parent=role, attrs={"step": "roles"})
-    add(project, "замечание", "Про сценарий", status="proposed", parent=scenario)
-    add(project, "правка", "Правка: Приём", status="proposed", attrs={"target": scenario, "field": "title", "new": "Приём у терапевта"})
-    project.store.bank("comp").put("competitor", {"name": "Докдок", "state": "proposed"}, "package:st")
-    issues = lambda sid: [(i["type"], i["text"]) for i in step_state(project, sid)["issues"]]    # noqa: E731
-    assert issues("roles") == [("remark", "Нет роли «Регистратор»")]
-    types = [t for t, _ in issues("scen")]
-    assert types == ["pending", "stale", "remark", "proposal", "check"]
-    assert ("remark", "Про сценарий") in issues("scen") and ("proposal", "Предложена правка к «Приём»") in issues("scen")
-    assert ("check", "У сценария «Приём» не указаны роли") in issues("scen")
-    assert issues("comp") == [("pending", "Не принято записей банка: 1")]
-    assert next(i for i in step_state(project, "scen")["issues"] if i["type"] == "remark")["card"]
-    steps = project.registry.get("st")["stage"]["steps"]
-    steps[1]["checks"] = lambda ctx, step: 1 / 0
-    assert "Проверка шага не сработала" in issues("scen")[-1][1]
 
 
 def test_improving_run_cannot_edit_human_or_accepted_cards_but_may_edit_its_own(make):
@@ -128,19 +92,3 @@ def test_reviewer_remarks_are_tagged_with_the_step(make):
     assert remark["attrs"]["step"] == "roles"
     assert [i["text"] for i in step_state(project, "roles")["issues"]] == ["Мало ролей"]
 
-
-def test_skip_part_and_public_help(make):
-    project = make(lambda note, call, request: "", stage=True)
-    assert project.state()["stages"]["st"]["skipped"] is False
-    assert project.skip_stage("st", True)["skipped"] is True and project.state()["stages"]["st"]["skipped"] is True
-    assert project.skip_stage("st", False)["skipped"] is False
-    with pytest.raises(EngineError):
-        project.skip_stage("clarify", True)
-    from idea_graph_engine.packages import normalize
-    from conftest import stage_manifest
-    manifest = stage_manifest()
-    manifest["stage"]["steps"][0]["help"] = "Выберите роли"
-    from idea_graph_engine.packages import Registry
-    registry = Registry(discover=False)
-    registry.register(manifest)
-    assert registry.public()[0]["stage"]["steps"][0]["help"] == "Выберите роли" and "checks" not in registry.public()[0]["stage"]["steps"][0]

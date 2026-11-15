@@ -137,7 +137,7 @@ def describe_choice(chosen: dict) -> str:
 
 
 class Project:
-    PROPAGATE_DELAY = 4.0      # сколько ждать после правки человека, прежде чем предлагать правки зависимого
+    PROPAGATE_DELAY = 15.0     # сколько ждать после правки человека, прежде чем предлагать правки зависимого
 
     def __init__(self, folder: str | os.PathLike, settings: Settings, registry: Registry,
                  adapters: Adapters | None = None):
@@ -232,7 +232,7 @@ class Project:
         return card
 
     def start(self, package_id: str, fresh: bool = False, auto: dict | None = None, step: str | None = None,
-              action: str | None = None, target: str | None = None, goal: str = "") -> dict:
+              action: str | None = None, target: str | None = None, goal: str = "", phase: str | None = None) -> dict:
         """Запустить пакет, помощника шага или автоматический режим.
 
         * без ``step``/``auto`` — продолжить диалог пакета с человеком;
@@ -242,12 +242,20 @@ class Project:
           цели — карточки верхнего уровня этапа (пусто — все). Нужна хотя бы одна.
 
         ``goal`` — необязательное «что улучшить» от человека; шаг с готовым результатом улучшается, а не делается заново.
+        ``phase`` — вместо шага: проверить (``review``) или уточнить (``clarify``) сразу весь крупный этап.
         """
         manifest = self._manifest(package_id)
         if manifest["kind"] != "agent":
             raise EngineError("not_runnable", f"Пакет «{manifest['name']}» не запускается как шаг")
-        step_def, role = None, ""
-        if step or action:
+        step_def, role, phase_steps = None, "", []
+        if phase and not step and action in ("review", "clarify"):
+            self._stage_manifest(package_id)
+            phase_steps = stage.phase_steps(manifest, phase, action)
+            if not phase_steps:
+                raise EngineError("no_action", f"У этапа «{phase}» нет действия «{ACTIONS[action]}»")
+            step_def = phase_steps[0]
+            role = "reviewer" if action == "review" else ""
+        elif step or action:
             self._stage_manifest(package_id)
             action = action or "suggest"
             if action not in ACTIONS:
@@ -291,6 +299,8 @@ class Project:
                 run.inbox.append("Начало работы пакета в автоматическом режиме.")
             elif action == "propagate":
                 run.inbox.append(self._propagate_text(manifest))
+            elif phase_steps:
+                run.inbox.append(self._phase_text(manifest, phase, phase_steps, action, target_card))
             elif step_def:
                 run.inbox.append(self._action_text(manifest, step_def, action, target_card, str(goal or "").strip()[:2000]))
             elif run.question is None and not run.inbox:
@@ -301,7 +311,7 @@ class Project:
             stage.bump_runs(self, manifest, step_def["id"])
         label = (" (автоматически)" if auto_info else f" — {ACTIONS[action]}" if action else "")
         self.say("system", f"Запущен пакет «{manifest['name']}»{label}"
-                 + (f", шаг «{step_def['title']}»" if step_def else ""), package_id, "start")
+                 + (f", этап «{phase}»" if phase_steps else f", шаг «{step_def['title']}»" if step_def else ""), package_id, "start")
         self._spawn(run, self._work, prepare=True, target=target)
         return run.public()
 
@@ -354,6 +364,17 @@ class Project:
             if improve:
                 head.append(improve)
         return "\n".join(head) + "\n" + text
+
+    def _phase_text(self, manifest: dict, phase: str, steps: list[dict], action: str, target: dict | None) -> str:
+        """Вводные для проверки или уточнения сразу всего крупного этапа: подсказки всех его шагов подряд."""
+        ctx = PackageContext(self, manifest["id"])
+        parts = [f"Крупный этап «{phase}». Действие: {ACTIONS[action]}."]
+        if target:
+            parts.append(f"Цель: карточка {target['id']} «{target['title']}».")
+        for step in steps:
+            prompt = step["prompts"][action]
+            parts.append(f"— Шаг «{step['title']}»: " + (prompt(ctx, step, target) if callable(prompt) else str(prompt)))
+        return "\n".join(parts)
 
     def _propagate_text(self, manifest: dict) -> str:
         state = stage.StageState(self, manifest["id"])
@@ -878,20 +899,24 @@ class Project:
 
     # ------------------------------------------------------------------ ворота, устаревание, правки зависимого
 
+    def document(self) -> str:
+        """Документ для разработки: собран из графа и банков; каждый пакет-этап пишет свои разделы (``manifest["document"]``)."""
+        parts = [f"# {self.store.title or self.folder.name}", ""]
+        packages = sorted(self.registry.items.values(), key=lambda m: (m.get("order") or 100, m["name"]))
+        for manifest in packages:
+            if callable(manifest.get("document")):
+                text = str(manifest["document"](PackageContext(self, manifest["id"])) or "").strip()
+                if text:
+                    parts += [text, ""]
+        if len(parts) <= 2:
+            parts.append("Документ пока пуст: добавьте сферу и запустите помощника.")
+        return "\n".join(parts).rstrip() + "\n"
+
     def stage_status(self, package_id: str) -> dict:
         return stage.describe(self, self._stage_manifest(package_id))
 
-    def approve_step(self, package_id: str, step_id: str, accept_all: bool = False) -> dict:
-        return self._stage_call(stage.approve, package_id, step_id, accept_all)
-
-    def reopen_step(self, package_id: str, step_id: str) -> dict:
-        return self._stage_call(stage.reopen, package_id, step_id)
-
     def clear_stale(self, package_id: str, step_id: str) -> dict:
         return self._stage_call(stage.clear_stale, package_id, step_id)
-
-    def skip_stage(self, package_id: str, skipped: bool) -> dict:
-        return self._stage_call(stage.set_skipped, package_id, bool(skipped))
 
     def _stage_call(self, function, package_id: str, *args) -> dict:
         try:

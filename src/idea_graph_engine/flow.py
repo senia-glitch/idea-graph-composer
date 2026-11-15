@@ -149,3 +149,32 @@ def solution(ctx: str, scenario: dict, solved: list[dict], unsolved: list[str], 
 "removed" — шаг убран (оставь его в списке с этой отметкой).
 Одна карточка kind="решение", title="Решение: <название сценария>", body — что автоматизируем и что получим, 2-3 предложения.
 {DIAGRAM_FORMAT}"""
+
+
+BOUNDS_LIMIT = 15
+BOUNDARY = "Граница системы: "
+
+
+def bounds(sphere: str, qa: list[tuple[str, str]], left: int) -> str:
+    done = "\n".join(f"- {q} → {a}" for q, a in qa) or "пока нет"
+    return f"""ЗАДАЧА: уточнить границы разрабатываемой системы.
+Сфера бизнеса: {sphere}.
+Уже спрошено и отвечено: {done}.
+Можно задать ещё не более {left} вопросов. Спрашивай по одному, закрытым вопросом с вариантами: что входит в систему, а что нет
+(какие процессы, каналы, интеграции, роли, платформы, масштаб, бюджет и сроки). Когда границ достаточно — вызови `finish`."""
+
+
+def review(what: str, ctx: str, items: list[dict], rule: str, improve: bool = False) -> str:
+    lines = "\n".join(f"- id={i['id']}: {'[принято] ' if i.get('have') else ''}{i['title']}" + (f" — {i['body']}" if i.get("body") else "")
+                      for i in items)
+    tail = ("Режим «улучшить»: карточки с отметкой [принято] уже есть. Если какая-то слабая, лишняя, дублирует другую или выходит за "
+            "границы — укажи её id в remove. Остальные предложения (без отметки) решай через accept.") if improve else \
+        "Вызови `decide` с accept — списком id принятых предложений."
+    return f"""ЗАДАЧА: решить, что принять ({what}).
+{ctx}
+
+Предложения:
+{lines}
+
+{rule}
+{tail}"""

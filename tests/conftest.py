@@ -53,6 +53,7 @@ def make(tmp_path):
         Store.create(tmp_path / "p", "Парикмахерская")
         settings = Settings(tmp_path / "settings.json")
         settings.data["helper"] = {"agent": "script", "model": "helper", "effort": ""}
+        settings.data["autopilot"] = {"agent": "script", "model": "pilot", "effort": ""}
         settings.data["researchers"] = [{"agent": "script", "model": f"r{i}", "effort": ""} for i in (1, 2, 3)]
         adapters = Adapters()
         adapter = ScriptAdapter(script)

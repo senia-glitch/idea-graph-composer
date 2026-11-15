@@ -1,5 +1,7 @@
 """Цепочка целиком: исследователи, банк, роли, сценарии, проблемы, диаграммы, решение."""
 
+import re
+
 import pytest
 from conftest import wait
 
@@ -13,7 +15,29 @@ TOBE = {"participants": ["Клиент", "Система"], "steps": [
     {"from": "Система", "to": "Клиент", "text": "Подтверждает запись", "mark": "auto"}]}
 
 
+def pilot(note, call):
+    """Автопилот: два вопроса о границах, затем принимает всё, а проблемы и решения — только первое."""
+    if "уточнить границы" in note:
+        if "Можно задать ещё не более 15" in note:
+            call("ask", question="Нужен ли платёжный модуль?", options=[{"title": "Нет"}, {"title": "Да"}])
+        elif "Можно задать ещё не более 14" in note:
+            call("ask", question="Какие каналы связи?", options=[{"title": "Сайт"}, {"title": "Бот"}])
+        else:
+            call("finish", summary="границ достаточно")
+        return
+    if "Режим «улучшить»" in note:
+        rows = re.findall(r"- id=(\S+?): (\[принято\] )?(.*)", note)
+        call("decide", accept=[i for i, have, _ in rows if not have],
+             remove=[i for i, have, title in rows if have and title.startswith("Салон Б")], reason="тест")
+        return
+    ids = re.findall(r"- id=(\S+?):", note)
+    first_only = "(проблемы)" in note or "(решение проблемы" in note
+    call("decide", accept=ids[:1] if first_only else ids, reason="тест")
+
+
 def script(model, note, call, request):
+    if model == "pilot":
+        return pilot(note, call)
     if model.startswith("r"):
         if "Проанализируй" in note:
             call("report", findings=[
@@ -26,7 +50,7 @@ def script(model, note, call, request):
                 {"kind": "конкурент", "title": "Салон Б", "description": "стрижки", "data": {"url": "https://www.b.ru/"}, "sources": ["https://b.ru"]}])
         return
     if "предложить роли" in note:
-        if "Ответ человека" not in note:
+        if "Ответ человека" not in note and "Автоматический режим" not in note:
             call("ask", question="Включать ли внешние системы?", options=[{"title": "Да"}, {"title": "Нет"}], recommended=[2])
             return
         call("graph_apply", ops=[{"op": "add_card", "kind": "роль", "title": "Клиент", "body": "записывается"},
@@ -190,3 +214,79 @@ def test_agent_failure_is_shown(make):
     p.start("roles")
     run = wait(p)
     assert run.status == "error" and "упал" in run.error
+
+
+def test_autopilot(make):
+    p = make(script)
+    with pytest.raises(EngineError):
+        p.start("autopilot")                                                       # без сферы нельзя
+    p.act("set_sphere", {"title": "парикмахерская"})
+    p.start("autopilot")
+    for question in ("Нужен ли платёжный модуль?", "Какие каналы связи?"):          # сначала вопросы о границах, по одному
+        run = wait(p)
+        assert run.status == "asking" and run.question["question"] == question
+        p.answer(run.question["id"], {"type": "choice", "indexes": [1]})
+    run = wait(p, ("done", "error", "stopped"))
+    assert run.status == "done", run.error
+    bounds = [r["data"]["text"] for r in p.records("requirement")]
+    assert len(bounds) == 2 and all(b.startswith("Граница системы: ") for b in bounds)
+    assert any("Нужен ли платёжный модуль? → Нет" in b for b in bounds)
+    assert "Нужен ли платёжный модуль?" in p.adapter.requests[0].note or any("Граница системы" in r.note for r in p.adapter.requests)
+    # цепочка пройдена до конца: всё принято агентом
+    assert sorted(r["data"]["state"] for r in p.records("competitor")) == ["accepted", "accepted"]
+    assert [c["status"] for c in kinds(p, "роль")] == ["accepted", "accepted"]
+    scenario = kinds(p, "сценарий")[0]
+    assert scenario["status"] == "accepted"
+    assert [c["title"] for c in kinds(p, "проблема")] == ["Не дозвониться"]            # вторая отклонена
+    assert "забывают прийти" in p.rejected("проблема")
+    assert kinds(p, "как есть") and kinds(p, "решение")
+    problem = kinds(p, "проблема")[0]
+    assert [v["title"] for v in p.cards("вариант", problem["id"])] == ["Запись на сайте"]
+    assert p.cards("вариант", problem["id"])[0]["status"] == "accepted"
+    assert not any(r.model == "helper" and "Ответ человека" in r.note for r in p.adapter.requests)   # помощник не спрашивал
+    # повторный запуск ничего не ломает и не спрашивает снова
+    before = len(kinds(p, "решение"))
+    p.start("autopilot")
+    assert wait(p).status == "done" and len(kinds(p, "решение")) == before
+
+
+def answer_bounds(p):
+    for _ in range(2):
+        run = wait(p)
+        assert run.status == "asking"
+        p.answer(run.question["id"], {"type": "choice", "indexes": [1]})
+    return wait(p, ("done", "error", "stopped"))
+
+
+def test_autopilot_agree_keeps_existing(make):
+    """Есть — не строим заново, а доводим до согласования: принятое не пересоздаётся, ждущее решения принимается."""
+    p = make(script)
+    p.act("set_sphere", {"title": "парикмахерская"})
+    p.act("bank_add", {"type": "competitor", "name": "Салон А", "url": "https://a.ru"})
+    p.act("add_role", {"title": "Клиент"})
+    p.act("add_role", {"title": "Администратор"})
+    p.start("autopilot")
+    run = answer_bounds(p)
+    assert run.status == "done", run.error
+    assert "Режим: довести до согласования" in " ".join(run.notes)
+    notes = [r.note for r in p.adapter.requests]
+    assert not any("предложить роли" in n for n in notes)                                   # роли есть: заново не просили
+    assert not any(r.model.startswith("r") and "Найди" in r.note for r in p.adapter.requests)  # конкурент есть: поиск не нужен
+    assert kinds(p, "решение")                                                               # а недостающее достроено
+
+
+def test_autopilot_improve_may_remove_and_rebuild(make):
+    p = make(script)
+    p.act("set_sphere", {"title": "парикмахерская"})
+    p.start("autopilot")
+    assert answer_bounds(p).status == "done"
+    assert len(p.accepted_competitors()) == 2
+    builds = lambda: sum("диаграмму «решение»" in r.note for r in p.adapter.requests)
+    before = builds()
+    p.start("autopilot", redo=True)                                                          # без вопросов: границы уже есть
+    run = wait(p, ("done", "error", "stopped"))
+    assert run.status == "done", run.error
+    assert "Режим: улучшить" in " ".join(run.notes)
+    assert [r["key"] for r in p.accepted_competitors()] == ["a.ru"]                          # слабое убрано
+    assert "b.ru" in p.rejected("competitor")
+    assert builds() == before + 1 and len(kinds(p, "решение")) == 1                                               # диаграмма перестроена

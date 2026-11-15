@@ -4,6 +4,7 @@
 и общие для всех проектов. Сам граф лежит в папке проекта.
 
     helper      — помощник: предлагает роли, сценарии, проблемы, варианты решения и строит диаграммы;
+    autopilot   — сильная модель: задаёт вопросы о границах системы и сама проходит цепочку;
     researchers — три исследователя с веб-поиском: ищут и анализируют конкурентов (дайте им разные модели).
 """
 
@@ -16,6 +17,7 @@ from pathlib import Path
 
 DEFAULTS = {
     "helper": {"agent": "claude", "model": "", "effort": ""},
+    "autopilot": {"agent": "claude", "model": "opus", "effort": ""},
     "researchers": [{"agent": "claude", "model": "opus", "effort": ""},
                     {"agent": "claude", "model": "sonnet", "effort": ""},
                     {"agent": "claude", "model": "haiku", "effort": ""}],
@@ -48,6 +50,8 @@ class Settings:
     def merge(self, raw: dict) -> None:
         if isinstance(raw.get("helper"), dict):
             self.data["helper"] = _slot(raw["helper"])
+        if isinstance(raw.get("autopilot"), dict):
+            self.data["autopilot"] = _slot(raw["autopilot"])
         if isinstance(raw.get("researchers"), list) and len(raw["researchers"]) == 3:
             self.data["researchers"] = [_slot(x) for x in raw["researchers"]]
         if "projects_root" in raw:

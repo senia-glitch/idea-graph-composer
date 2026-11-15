@@ -33,6 +33,8 @@ class Run:
 
     def __init__(self, kind: str, title: str):
         self.kind, self.title = kind, title
+        self.auto = kind == "autopilot"     # вопросы помощника отключены: решает автопилот
+        self.improve = False                # автопилот: улучшать уже сделанное, а не только доводить до согласования
         self.status = "running"            # running | asking | done | error | stopped
         self.error = ""
         self.summary = ""
@@ -332,6 +334,7 @@ class Project:
         plan = self._plan(kind, [str(i) for i in (ids or [])], redo)
         run = Run(kind, plan["title"])
         run.total = plan.get("total", 1)
+        run.improve = kind == "autopilot" and redo
         self.run = run
         self._touch()
         threading.Thread(target=self._work, args=(run, plan), daemon=True).start()
@@ -339,6 +342,8 @@ class Project:
 
     def _plan(self, kind: str, ids: list[str], redo: bool) -> dict:
         sphere = self.need_sphere()
+        if kind == "autopilot":
+            return {"title": "Автопилот: уточняет границы системы…", "kind": kind}
         if kind == "competitors":
             return {"title": "Исследователи ищут конкурентов…", "kind": kind}
         if kind == "analysis":
@@ -392,7 +397,9 @@ class Project:
     def _work(self, run: Run, plan: dict) -> None:
         try:
             kind = plan["kind"]
-            if kind == "competitors":
+            if kind == "autopilot":
+                self._job_autopilot(run)
+            elif kind == "competitors":
                 self._job_competitors(run)
             elif kind == "analysis":
                 self._job_analysis(run, plan)
@@ -598,9 +605,12 @@ class Project:
     def _converse(self, run: Run, note: str, allowed: set, target: str) -> None:
         """Ходы помощника, пока он не закончит; в спорной ситуации он спрашивает человека и продолжает с его ответом."""
         session, task = "", note
+        if run.auto:
+            note = task = "Автоматический режим: вопросов не задавай, реши сам.\n\n" + note
         while True:
             token = secrets.token_urlsafe(24)
-            ctx = {"kind": "helper", "run": run, "allowed": allowed, "target": target, "asked": False, "note": note, "created": 0}
+            ctx = {"kind": "helper", "run": run, "allowed": allowed, "target": target, "asked": False, "note": note, "created": 0,
+                   "auto": run.auto}
             self.tokens[token] = ctx
             run.answered.clear()
             try:
@@ -633,7 +643,13 @@ class Project:
         ctx = self.tokens.get(token)
         if ctx is None:
             raise EngineError("bad_token", "Ход уже закончен: инструменты недоступны")
-        return tools.RESEARCH_TOOLS if ctx["kind"] == "researcher" else tools.HELPER_TOOLS
+        if ctx["kind"] == "researcher":
+            return tools.RESEARCH_TOOLS
+        if ctx["kind"] == "bounds":
+            return tools.BOUNDS_TOOLS
+        if ctx["kind"] == "pilot":
+            return tools.PILOT_TOOLS
+        return [x for x in tools.HELPER_TOOLS if x["name"] != "ask"] if ctx.get("auto") else tools.HELPER_TOOLS
 
     def tool_call(self, token: str, tool: str, args: dict) -> str:
         ctx = self.tokens.get(token)
@@ -642,6 +658,21 @@ class Project:
         args = args if isinstance(args, dict) else {}
         if tool == "turn_info":
             return ctx["note"]
+        if ctx["kind"] == "pilot":
+            if tool != "decide":
+                raise EngineError("unknown_tool", "Здесь есть только turn_info и decide")
+            raw = args.get("accept")
+            ids = [str(i) for i in raw if i is not None] if isinstance(raw, list) else []
+            rm = args.get("remove")
+            ctx["decision"] = {"accept": ids, "reason": _clip(args.get("reason"), 300),
+                               "remove": [str(i) for i in rm if i is not None] if isinstance(rm, list) else []}
+            return "Принято. Заверши ход."
+        if ctx["kind"] == "bounds":
+            if tool == "ask":
+                return self._tool_ask(ctx, args)
+            if tool == "finish":
+                return "Принято."
+            raise EngineError("unknown_tool", "Здесь есть только turn_info, ask и finish")
         if ctx["kind"] == "researcher":
             if tool != "report":
                 raise EngineError("unknown_tool", "У исследователя есть только turn_info и report")
@@ -677,6 +708,8 @@ class Project:
         return "Принято. Заверши ход."
 
     def _tool_ask(self, ctx: dict, args: dict) -> str:
+        if ctx.get("auto"):
+            raise EngineError("auto_mode", "Сейчас автоматический режим: вопросов не задавай, реши сам")
         if ctx["asked"]:
             raise EngineError("one_question", "За ход можно задать только один вопрос")
         options = [{"title": _clip(o.get("title"), 200), "consequence": _clip(o.get("consequence"), 200)}
@@ -753,3 +786,252 @@ class Project:
             ctx["created"] += created
             self._touch()
         return f"Добавлено карточек: {created}." + (f" Уже есть или отклонялись, пропущено: {', '.join(skipped)}." if skipped else "")
+
+    # ------------------------------------------------------------------ автопилот
+
+    def _stage(self, run: Run, text: str) -> None:
+        run.title = "Автопилот: " + text
+        self._touch()
+
+    def _boundary_records(self) -> list[dict]:
+        return [r for r in self.records("requirement") if str((r["data"] or {}).get("text", "")).startswith(flow.BOUNDARY)]
+
+    def _bounds(self, run: Run) -> None:
+        """Сильная модель по одному задаёт закрытые вопросы о границах системы (до 15); ответы — требования в банке."""
+        sphere = self.need_sphere()
+        qa: list[tuple[str, str]] = []
+        session = ""
+        run.total = flow.BOUNDS_LIMIT
+        while len(qa) < flow.BOUNDS_LIMIT:
+            token = secrets.token_urlsafe(24)
+            note = flow.bounds(sphere["title"], qa, flow.BOUNDS_LIMIT - len(qa))
+            ctx = {"kind": "bounds", "run": run, "asked": False, "note": note}
+            self.tokens[token] = ctx
+            run.answered.clear()
+            try:
+                result = self._request(self.settings.data["autopilot"], "autopilot", tools.BOUNDS_RULES, note, token, session, False, run)
+            finally:
+                self.tokens.pop(token, None)
+            if run.stop:
+                return
+            if result.error:
+                raise EngineError("agent_error", result.error)
+            session = result.session_id or session
+            if not ctx["asked"]:
+                return
+            run.status = "asking"
+            self._touch()
+            run.answered.wait()
+            if run.stop:
+                return
+            question = run.question
+            answer = self._answer_text(question, run.answer or {})
+            qa.append((question["question"], answer))
+            text = f"{flow.BOUNDARY}{question['question']} → {answer}"
+            self.bank.put("requirement", {"text": text}, HUMAN, key=f"requirement|{text.lower()}")
+            run.question = None
+            run.done = len(qa)
+
+    def _pilot_decide(self, run: Run, what: str, items: list[dict], rule: str, improve: bool = False) -> tuple[set[str], set[str]]:
+        """Сильная модель выбирает, что принять из предложенного (и, в режиме улучшения, что убрать из принятого)."""
+        if not items:
+            return set(), set()
+        note = flow.review(what, self.knowledge(), items, rule, improve)
+        token = secrets.token_urlsafe(24)
+        ctx = {"kind": "pilot", "run": run, "note": note, "decision": None}
+        self.tokens[token] = ctx
+        try:
+            result = self._request(self.settings.data["autopilot"], "autopilot", tools.PILOT_RULES, note, token, "", False, run)
+        finally:
+            self.tokens.pop(token, None)
+        if run.stop:
+            return set(), set()
+        if result.error:
+            raise EngineError("agent_error", result.error)
+        if ctx["decision"] is None:
+            raise EngineError("no_decision", f"Автопилот не принял решения ({what}). Попробуйте ещё раз")
+        fresh = {i["id"] for i in items if not i.get("have")}
+        have = {i["id"] for i in items if i.get("have")}
+        accept = {a for a in ctx["decision"]["accept"] if a in fresh}
+        remove = {a for a in ctx["decision"]["remove"] if a in have} if improve else set()
+        run.notes.append(f"{what}: принято {len(accept)} из {len(fresh)}" + (f", убрано {len(remove)}" if remove else "")
+                         + (f" — {ctx['decision']['reason']}" if ctx["decision"]["reason"] else ""))
+        return accept, remove
+    def _decide_cards(self, run: Run, what: str, kind: str, parent: str | None, rule: str, review_existing: bool = False) -> None:
+        """Предложенное принимается или отклоняется; в режиме улучшения заодно убирается слабое из уже принятого."""
+        cards = self.cards(kind, parent)
+        pending = [c for c in cards if c["status"] == PROPOSED]
+        existing = [c for c in cards if c["status"] == ACCEPTED] if review_existing else []
+        items = [{"id": c["id"], "title": c["title"], "body": c["body"], "have": c in existing} for c in existing + pending]
+        accept, remove = self._pilot_decide(run, what, items, rule, review_existing)
+        if run.stop:
+            return
+        for c in pending:
+            (self.do_accept if c["id"] in accept else self.do_remove)({"id": c["id"]})
+        for c in existing:
+            if c["id"] in remove:
+                self.do_remove({"id": c["id"]})
+        self._touch()
+
+    def _step_cards(self, run: Run, label: str, kind: str, parent: str | None, rule: str, generate) -> None:
+        """Один шаг цепочки в трёх режимах: нет — строим; есть — доводим до согласования; режим улучшения — ещё и дополняем."""
+        cards = self.cards(kind, parent)
+        have = [c for c in cards if c["status"] == ACCEPTED]
+        pending = [c for c in cards if c["status"] == PROPOSED]
+        if run.improve and have:
+            self._decide_cards(run, label, kind, parent, rule, review_existing=True)    # оценить то, что есть
+            if run.stop:
+                return
+            generate()                                                                  # дополнить недостающим
+            if run.stop:
+                return
+            self._decide_cards(run, label, kind, parent, rule)
+        else:
+            if not have and not pending:
+                generate()                                                              # ничего нет — строим
+                if run.stop:
+                    return
+            self._decide_cards(run, label, kind, parent, rule)                          # доводим до согласования
+
+    def _survey(self) -> str:
+        """Что уже есть в проекте: по этому автопилот выбирает режим."""
+        cards = self.store.snapshot()["cards"]
+
+        def count(kind):
+            return [sum(1 for c in cards if c["kind"] == kind and c["status"] == ACCEPTED),
+                    sum(1 for c in cards if c["kind"] == kind and c["status"] == PROPOSED)]
+
+        comps = self.records("competitor")
+        parts = [("конкуренты", [sum(1 for r in comps if r["data"].get("state") == "accepted"),
+                                 sum(1 for r in comps if r["data"].get("state") == "proposed")]),
+                 ("факты", [len(self.records("fact")), 0])] + [(n, count(k)) for n, k in (
+                     ("роли", flow.ROLE), ("сценарии", flow.SCENARIO), ("проблемы", flow.PROBLEM), ("варианты", flow.VARIANT),
+                     ("«как есть»", flow.ASIS), ("«решение»", flow.SOLUTION))]
+        found = [f"{n}: {a} принято" + (f", {p} ждёт решения" if p else "") for n, (a, p) in parts if a or p]
+        return "; ".join(found)
+
+    def _job_autopilot(self, run: Run) -> None:
+        self.need_sphere()
+        survey = self._survey()
+        mode = "построить" if not survey else ("улучшить" if run.improve else "довести до согласования")
+        run.improve = run.improve and bool(survey)
+        run.notes.append(f"Уже есть: {survey or 'ничего'}. Режим: {mode}")
+        if not self._boundary_records():
+            self._bounds(run)
+            if run.stop:
+                return
+        run.status = "running"
+        self._stage(run, "конкуренты")
+        self._pilot_competitors(run)
+        if run.stop:
+            return
+        self._stage(run, "анализ конкурентов")
+        try:
+            plan = self._plan("analysis", [], False)
+        except EngineError:
+            plan = None
+        if plan:
+            self._job_analysis(run, plan)
+        if run.stop:
+            return
+        for kind, label, card_kind, rule in (
+                ("roles", "роли", flow.ROLE, "Принимай роли, которые реально участвуют в процессах этой сферы."),
+                ("scenarios", "сценарии", flow.SCENARIO,
+                 "Принимай ключевые сценарии, которые стоит автоматизировать и которые в границах системы.")):
+            self._stage(run, label)
+            self._step_cards(run, label, card_kind, None, rule, lambda kind=kind: self._job_global(run, kind))
+            if run.stop:
+                return
+            if not self._accepted_all(card_kind):
+                raise EngineError("pilot_stuck", f"Автопилот не принял ни одной карточки «{label}»: добавьте свои или повторите")
+        scenarios = self._accepted_all(flow.SCENARIO)
+        for number, scenario in enumerate(scenarios, 1):
+            if run.stop:
+                return
+            self._scenario_pilot(run, scenario, f"{number}/{len(scenarios)} «{scenario['title']}»")
+        if not run.stop:
+            run.summary = f"Автопилот ({mode}) прошёл цепочку: сценариев {len(scenarios)}"
+
+    def _pilot_competitors(self, run: Run) -> None:
+        def decide(review_existing: bool) -> None:
+            comps = self.records("competitor")
+            pending = [r for r in comps if r["data"].get("state") == "proposed"]
+            existing = [r for r in comps if r["data"].get("state") == "accepted"] if review_existing else []
+            items = [{"id": r["id"], "title": r["data"].get("name", ""), "have": r in existing,
+                      "body": f"{r['data'].get('url', '')} {r['data'].get('why', '')}"} for r in existing + pending]
+            accept, remove = self._pilot_decide(
+                run, "конкуренты", items,
+                "Принимай только сайты настоящих бизнесов этой сферы: не конструкторы сайтов, не гиганты, не агрегаторы.", review_existing)
+            if run.stop:
+                return
+            for r in pending:
+                if r["id"] in accept:
+                    self.do_bank_update({"id": r["id"], "state": "accepted"})
+                else:
+                    self.do_bank_remove({"id": r["id"]})
+            for r in existing:
+                if r["id"] in remove:
+                    self.do_bank_remove({"id": r["id"]})
+
+        have = self.accepted_competitors()
+        pending = [r for r in self.records("competitor") if r["data"].get("state") == "proposed"]
+        if run.improve and have:
+            decide(True)
+            if run.stop:
+                return
+            self._job_competitors(run)
+            if run.stop:
+                return
+            decide(False)
+        else:
+            if not have and not pending:
+                self._job_competitors(run)
+                if run.stop:
+                    return
+            decide(False)
+        if not run.stop and not self.accepted_competitors():
+            raise EngineError("pilot_stuck", "Автопилот не принял ни одного конкурента: добавьте своих или повторите")
+
+    def _accepted_all(self, kind: str) -> list[dict]:
+        return [c for c in self.cards(kind) if c["status"] == ACCEPTED]
+
+    def _scenario_pilot(self, run: Run, scenario: dict, label: str) -> None:
+        sid = scenario["id"]
+        self._stage(run, f"проблемы, сценарий {label}")
+        self._step_cards(run, "проблемы", flow.PROBLEM, sid,
+                         "Принимай существенные проблемы, которые стоит автоматизировать и которые в границах системы.",
+                         lambda: self._job_scenarios(run, {"kind": "problems", "scenarios": [scenario]}))
+        if run.stop:
+            return
+        if not self._accepted(flow.PROBLEM, sid):
+            run.notes.append(f"Сценарий «{scenario['title']}»: проблем не принято, пропущен")
+            return
+        if run.improve or not self.cards(flow.ASIS, sid):          # в режиме улучшения диаграмма перестраивается по обновлённым проблемам
+            self._stage(run, f"«как есть», сценарий {label}")
+            self._job_scenarios(run, {"kind": "asis", "scenarios": [scenario]})
+            if run.stop:
+                return
+        self._stage(run, f"варианты решения, сценарий {label}")
+        unsolved = [p for p in self._accepted(flow.PROBLEM, sid) if not self._accepted(flow.VARIANT, p["id"])]
+        fresh = [p for p in unsolved if not self.cards(flow.VARIANT, p["id"])]
+        if fresh:
+            self._job_variants(run, {"problems": fresh})
+            if run.stop:
+                return
+        for problem in unsolved:
+            pending = [c for c in self.cards(flow.VARIANT, problem["id"]) if c["status"] == PROPOSED]
+            items = [{"id": c["id"], "title": c["title"], "body": c["body"]} for c in pending]
+            accept, _ = self._pilot_decide(run, f"решение проблемы «{problem['title']}»", items,
+                                           "Выбери не более ОДНОГО варианта, который лучше всего решает проблему в границах системы; "
+                                           "если ни один не подходит — оставь accept пустым.")
+            if run.stop:
+                return
+            chosen = next((c for c in pending if c["id"] in accept), None)
+            if chosen:
+                self.do_choose_variant({"id": chosen["id"]})
+            else:
+                for c in pending:
+                    self.do_remove({"id": c["id"]})
+        if self._solved(sid) and (run.improve or not self.cards(flow.SOLUTION, sid)):
+            self._stage(run, f"диаграмма «решение», сценарий {label}")
+            self._job_scenarios(run, {"kind": "solution", "scenarios": [scenario]})

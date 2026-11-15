@@ -3,24 +3,18 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "idea-graph-composer"
-version = "0.1.0"
-description = "Компоновщик: карта пакетов и прогон по ней"
+name = "idea-graph-engine"
+version = "0.2.0"
+description = "Движок «Графа идеи»: запуск агентов, этапы с воротами, совет, ревью, исследователи, банки"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["idea-graph-core @ git+https://github.com/senia-glitch/idea-graph-core.git"]
 
 [project.optional-dependencies]
 test = ["pytest"]
 
-[project.entry-points."idea_graph.packages"]
-composer = "idea_graph_composer:manifest"
-
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-idea_graph_composer = ["*.md", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

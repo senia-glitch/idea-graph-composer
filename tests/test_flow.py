@@ -134,8 +134,14 @@ def test_whole_chain(make):
     p.start("variants")
     wait(p)
     variants = kinds(p, "вариант")
+    problem = next(c for c in kinds(p, "проблема") if c["title"] == "Не дозвониться")
+    assert {v["id"] for v in p.cards("вариант", problem["id"])} == {v["id"] for v in variants}      # варианты — у проблемы, не у сценария
+    assert p.cards("вариант", scenario["id"]) == []
     p.act("choose_variant", {"id": variants[0]["id"]})
     assert [v["title"] for v in kinds(p, "вариант")] == ["Запись на сайте"]
+    p.act("add_variant", {"problem": problem["id"], "title": "Свой"})
+    assert len(p.cards("вариант", problem["id"])) == 2
+    p.act("remove", {"id": p.cards("вариант", problem["id"])[1]["id"]})
     p.start("solution")
     assert wait(p).status == "done"
     assert kinds(p, "решение")[0]["attrs"]["diagram"]["steps"][0]["mark"] == "new"

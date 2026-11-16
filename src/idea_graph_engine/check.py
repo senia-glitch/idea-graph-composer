@@ -46,7 +46,13 @@ def issues(project) -> list[dict]:
     """Разногласия, видные без чтения смысла. Каждое: id (i1…), code, text, card (главная карточка), scenario.
 
     Коды: empty, no_decision, no_roles, unused_role (правит человек или автомат по пункту) и diagram (чинится перестроением в конце).
+    Весь расчёт идёт по одному снимку графа.
     """
+    with project.frozen():
+        return _issues(project)
+
+
+def _issues(project) -> list[dict]:
     out: list[dict] = []
 
     def add(code: str, text: str, card: str = "", scenario: str = "") -> None:
@@ -121,7 +127,12 @@ def findings(project) -> list[str]:
 
 
 def graph_text(project) -> str:
-    """Граф проекта для чтения агентом: что принято, с id карточек и порядковыми номерами создания."""
+    """Граф проекта для чтения агентом: что принято, с id карточек и порядковыми номерами создания. Один снимок графа."""
+    with project.frozen():
+        return _graph_text(project)
+
+
+def _graph_text(project) -> str:
     out = ["Роли и компоненты (единое пространство имён участников диаграмм):"]
     roles = project._accepted_all(flow.ROLE)
     out += [f"- {ref(r)} [{project._role_type(r)}]: {r.get('body') or 'нет описания'}" for r in roles] or ["- нет"]

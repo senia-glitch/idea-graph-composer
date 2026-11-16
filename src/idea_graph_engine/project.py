@@ -12,6 +12,7 @@ import json
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from idea_graph_core import ACCEPTED, HUMAN, PROPOSED, GraphError, Store, normalize_url
@@ -62,6 +63,8 @@ class Project:
         self.settings, self.adapters = settings, adapters
         self.bank = self.store.bank(flow.BANK)
         self.lock = threading.RLock()
+        self._local = threading.local()      # замороженный снимок графа: свой у каждого потока
+        self._log_lock = threading.Lock()
         self.run: Run | None = None
         self.tokens: dict[str, dict] = {}
         self.version = 0
@@ -84,6 +87,39 @@ class Project:
     def _touch(self) -> None:
         self.version += 1
 
+    def _snap(self) -> dict:
+        frozen = getattr(self._local, "snap", None)
+        return frozen if frozen is not None else self.store.snapshot()
+
+    @contextmanager
+    def frozen(self):
+        """Один снимок графа на всё чтение внутри блока (только чтение; в других потоках граф виден как обычно)."""
+        if getattr(self._local, "snap", None) is not None:
+            yield
+            return
+        self._local.snap = self.store.snapshot()
+        try:
+            yield
+        finally:
+            self._local.snap = None
+
+    def warnings(self) -> list[str]:
+        """Что в открытом проекте может помешать работе (только предупреждения, ничего не запрещается)."""
+        out: list[str] = []
+        with self.frozen():
+            roles = self._accepted_all(flow.ROLE)
+            scenarios = self._accepted_all(flow.SCENARIO)
+            untyped = [r["title"] for r in roles if not (r.get("attrs") or {}).get("type")]
+            if untyped:
+                out.append("Роли без типа считаются людьми: " + ", ".join(untyped[:5]) + ("…" if len(untyped) > 5 else ""))
+            if scenarios and not self._components():
+                out.append("Нет компонентов системы (Сайт, Админка…): диаграммы и проверка перед выгрузкой не заработают. "
+                           "Примите хотя бы один компонент на шаге «Роли»")
+            stale = {i["scenario"] for i in check.issues(self) if i["code"] == "diagram"}
+            if stale:
+                out.append(f"Диаграммы не соответствуют графу в сценариях: {len(stale)}. Их перестроит проверка перед выгрузкой")
+        return out
+
     def state(self) -> dict:
         return {"title": self.store.title, "revision": self.store.revision, "version": self.version,
                 "run": self.run.public() if self.run else None}
@@ -103,7 +139,7 @@ class Project:
     # ------------------------------------------------------------------ чтение графа и банка
 
     def cards(self, kind: str, parent: str | None = None) -> list[dict]:
-        snap = self.store.snapshot()
+        snap = self._snap()
         under = None
         if parent:
             under = {e["from"] for e in snap["edges"] if e["to"] == parent and e["kind"] == "детализирует"}
@@ -127,7 +163,7 @@ class Project:
             raise EngineError("unknown_card", error.message) from None
 
     def roles_of(self, scenario_id: str) -> list[dict]:
-        snap = self.store.snapshot()
+        snap = self._snap()
         cards = {c["id"]: c for c in snap["cards"]}
         return [cards[e["to"]] for e in snap["edges"] if e["from"] == scenario_id and e["kind"] == flow.PARTICIPATES and e["to"] in cards]
 
@@ -378,16 +414,17 @@ class Project:
     # ------------------------------------------------------------------ запуск агентов
 
     def start(self, kind: str, ids: list[str] | None = None, redo: bool = False, each: bool = False) -> dict:
-        if self.run and self.run.status in ("running", "asking"):
-            raise EngineError("busy", "Уже идёт работа агентов")
-        plan = self._plan(kind, [str(i) for i in (ids or [])], redo)
-        run = Run(kind, plan["title"])
-        run.total = plan.get("total", 1)
-        run.improve = kind == "autopilot" and redo
-        run.each = kind == "autopilot" and each
-        self.run = run
-        self._touch()
-        threading.Thread(target=self._work, args=(run, plan), daemon=True).start()
+        with self.lock:                      # проверка «не занято» и запуск — одна неделимая операция
+            if self.run and self.run.status in ("running", "asking"):
+                raise EngineError("busy", "Уже идёт работа агентов")
+            plan = self._plan(kind, [str(i) for i in (ids or [])], redo)
+            run = Run(kind, plan["title"])
+            run.total = plan.get("total", 1)
+            run.improve = kind == "autopilot" and redo
+            run.each = kind == "autopilot" and each
+            self.run = run
+            self._touch()
+            threading.Thread(target=self._work, args=(run, plan), daemon=True).start()
         return {}
 
     def _plan(self, kind: str, ids: list[str], redo: bool) -> dict:
@@ -525,7 +562,25 @@ class Project:
             env={"IDEA_GRAPH_URL": self.base_url, "IDEA_GRAPH_TOKEN": token}, session_id=session,
             model=slot.get("model") or "", effort=slot.get("effort") or "", web_search=web, on_process=remember,
             extra={"token": token, "project": self})
-        return adapter.run(request)
+        began = time.time()
+        result = adapter.run(request)
+        self._journal(name, slot, began, result)
+        return result
+
+    def _journal(self, name: str, slot: dict, began: float, result: TurnResult) -> None:
+        """Журнал работы агентов (.idea-graph/agents.log): время, кто, какая модель, сколько длилось, чем кончилось. Тексты графа не пишутся."""
+        line = {"time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(began)), "turn": name, "agent": slot.get("agent") or "",
+                "model": slot.get("model") or "", "seconds": round(time.time() - began, 1), "cost": result.cost,
+                "error": _clip(result.error, 300)}
+        try:
+            with self._log_lock:
+                path = self.dir / "agents.log"
+                if path.exists() and path.stat().st_size > 1_000_000:
+                    path.replace(self.dir / "agents.log.1")
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(line, ensure_ascii=False) + "\n")
+        except OSError:
+            pass                              # журнал не должен ломать работу
 
     # ---- исследователи
 
@@ -910,9 +965,9 @@ class Project:
         except GraphError:
             return False
 
-    def _checker_turn(self, run: Run, slot: dict, sphere: dict, bounds: list[str], found: list[dict]) -> dict | None:
+    def _checker_turn(self, run: Run, slot: dict, sphere: dict, bounds: list[str], found: list[dict], text: str | None = None) -> dict | None:
         """Один вызов проверяющего на весь граф. Возвращает отчёт (None — остановлено)."""
-        note = flow.verify(sphere["title"], bounds, check.graph_text(self), found)
+        note = flow.verify(sphere["title"], bounds, text if text is not None else check.graph_text(self), found)
         token = secrets.token_urlsafe(24)
         ctx = {"kind": "check", "run": run, "note": note, "report": None, "bounds": bounds, "found": found}
         self.tokens[token] = ctx
@@ -974,9 +1029,11 @@ class Project:
         fixed = 0
         while True:
             bounds = [str((r["data"] or {}).get("text", ""))[len(flow.BOUNDARY):] for r in self._boundary_records()]
-            found = check.issues(self)
+            with self.frozen():                                           # найденное кодом и текст графа для проверяющего — из одного снимка
+                found = check.issues(self)
+                text = check.graph_text(self)
             run.total = run.done = 0                                      # числа в заголовке — только пока идёт вопрос или правка
-            report = self._checker_turn(run, slot, sphere, bounds, found)
+            report = self._checker_turn(run, slot, sphere, bounds, found, text)
             if report is None:
                 return
             items = check.build_items(self, report, bounds, found)

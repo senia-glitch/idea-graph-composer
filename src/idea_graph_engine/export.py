@@ -36,6 +36,10 @@ def _steps(diagram: dict, solution: bool) -> list[str]:
             extra = "Проблема: " + str(step["pain"].get("what") or "")
         rows.append([number, step.get("from"), step.get("to"), step.get("text"), extra])
     head = ["№", "От кого", "Кому", "Что", "Отметка" if solution else "Проблема"]
+    if solution:                                                              # какое выбранное решение вводит изменённый шаг
+        head.append("Решение")
+        for row, step in zip(rows, (diagram or {}).get("steps") or []):
+            row.append(step.get("by"))
     if not rows:
         return ["_Шаги не описаны._", ""]
     return _table(head, rows)

@@ -25,6 +25,7 @@ SIGN_OF = {v: k for k, v in MARK_SIGNS.items()}
 MAX_PARTICIPANTS, MAX_STEPS = 12, 60
 ARROW = re.compile(r"\s*(?:→|->|=>|-->)\s*")
 PAIN = re.compile(r"\[\s*боль\s*:(.*?)\]\s*$", re.I)
+BY = re.compile(r"\[\s*решение\s*:(.*?)\]\s*$", re.I)
 
 
 def _text(value, limit: int) -> str:
@@ -66,6 +67,9 @@ def normalize(raw) -> dict:
             step["pain"] = pain
         mark = _text(item.get("mark"), 10).lower()
         step["mark"] = mark if mark in MARKS else ""
+        by = _text(item.get("by"), 200)
+        if by and step["mark"]:
+            step["by"] = by                                   # какое выбранное решение вводит этот шаг («решение»)
         steps.append(step)
     if len(participants) > MAX_PARTICIPANTS:
         raise ValueError(f"участников не больше {MAX_PARTICIPANTS}")
@@ -106,7 +110,10 @@ def parse_text(text: str) -> dict:
         mark = ""
         if line[0] in MARK_SIGNS and (len(line) > 1 and line[1] in " \t" or not line[1:2].isalnum()):
             mark, line = MARK_SIGNS[line[0]], line[1:].strip()
-        pain = None
+        pain, by = None, ""
+        made = BY.search(line)
+        if made:
+            line, by = line[:made.start()].strip(), made.group(1).strip()
         found = PAIN.search(line)
         if found:
             line = line[:found.start()].strip()
@@ -116,7 +123,7 @@ def parse_text(text: str) -> dict:
         sides = ARROW.split(head.strip(), maxsplit=1)
         if len(sides) != 2 or not text_part.strip():
             continue
-        step = {"from": sides[0], "to": sides[1], "text": text_part, "mark": mark}
+        step = {"from": sides[0], "to": sides[1], "text": text_part, "mark": mark, "by": by}
         if pain:
             step["pain"] = pain
         steps.append(step)
@@ -132,6 +139,8 @@ def to_text(diagram: dict) -> str:
         pain = step.get("pain")
         if pain:
             line += f" [боль: {pain.get('what', '')} | {pain.get('often', '')} | {pain.get('cost', '')} | {pain.get('importance', '')}]"
+        if step.get("by"):
+            line += f" [решение: {step['by']}]"
         lines.append(line)
     return "\n".join(lines)
 

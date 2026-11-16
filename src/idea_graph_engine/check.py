@@ -135,4 +135,6 @@ def validate_fix(project, fix) -> dict:
             clean["importance"] = str(fix["importance"]).strip().lower()
         if len(clean) == 2:
             raise ValueError("в правке edit нужен хотя бы один из title, body, importance")
+        if len(clean.get("body", "")) > 250:
+            raise ValueError("описание в edit — до 250 символов, 1-2 предложения")
     return clean

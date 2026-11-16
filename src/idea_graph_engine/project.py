@@ -16,7 +16,7 @@ from pathlib import Path
 
 from idea_graph_core import ACCEPTED, HUMAN, PROPOSED, GraphError, Store, normalize_url
 
-from . import diagrams, export, flow, tools
+from . import check, diagrams, export, flow, tools
 from .agents import TurnRequest, TurnResult
 from .errors import EngineError
 
@@ -33,7 +33,7 @@ class Run:
 
     def __init__(self, kind: str, title: str):
         self.kind, self.title = kind, title
-        self.auto = kind == "autopilot"     # вопросы помощника отключены: решает автопилот
+        self.auto = kind in ("autopilot", "export")     # вопросы помощника отключены: решает автопилот или идёт проверка перед выгрузкой
         self.improve = False                # автопилот: улучшать уже сделанное, а не только доводить до согласования
         self.status = "running"            # running | asking | done | error | stopped
         self.error = ""
@@ -152,7 +152,9 @@ class Project:
                  for r in self.records("fact") if (r["data"] or {}).get("competitor") in names or not (r["data"] or {}).get("competitor")]
         sphere = self.need_sphere()
         comps = [f"{d.get('name')} ({d.get('url')})" for d in (r["data"] for r in self.accepted_competitors())]
-        return flow.context(sphere["title"], requirements, comps, facts[:80])
+        bounds = [t[len(flow.BOUNDARY):] for t in requirements if t.startswith(flow.BOUNDARY)]
+        wishes = [t for t in requirements if not t.startswith(flow.BOUNDARY)]
+        return flow.context(sphere["title"], wishes, comps, facts[:80], bounds)
 
     # ------------------------------------------------------------------ действия человека
 
@@ -349,6 +351,8 @@ class Project:
 
     def _plan(self, kind: str, ids: list[str], redo: bool) -> dict:
         sphere = self.need_sphere()
+        if kind == "export":
+            return {"title": "Проверка согласованности перед выгрузкой…", "kind": kind}
         if kind == "autopilot":
             return {"title": "Автопилот: уточняет границы системы…", "kind": kind}
         if kind == "competitors":
@@ -404,7 +408,9 @@ class Project:
     def _work(self, run: Run, plan: dict) -> None:
         try:
             kind = plan["kind"]
-            if kind == "autopilot":
+            if kind == "export":
+                self._job_export(run)
+            elif kind == "autopilot":
                 self._job_autopilot(run)
             elif kind == "competitors":
                 self._job_competitors(run)
@@ -654,6 +660,8 @@ class Project:
             return tools.RESEARCH_TOOLS
         if ctx["kind"] == "bounds":
             return tools.BOUNDS_TOOLS
+        if ctx["kind"] == "check":
+            return tools.CHECK_TOOLS
         if ctx["kind"] == "pilot":
             return tools.PILOT_TOOLS
         return [x for x in tools.HELPER_TOOLS if x["name"] != "ask"] if ctx.get("auto") else tools.HELPER_TOOLS
@@ -674,6 +682,16 @@ class Project:
             ctx["decision"] = {"accept": ids, "reason": _clip(args.get("reason"), 300),
                                "remove": [str(i) for i in rm if i is not None] if isinstance(rm, list) else []}
             return "Принято. Заверши ход."
+        if ctx["kind"] == "check":
+            if tool == "conflict":
+                return self._tool_conflict(ctx, args)
+            if tool == "finish":
+                left = check.findings(self)
+                if left:
+                    raise EngineError("not_finished", "Ещё не разрешено проверкой кода: " + "; ".join(left[:6]) + ". Задай вопрос по первому из них.")
+                ctx["finished"] = True
+                return "Принято."
+            raise EngineError("unknown_tool", "Здесь есть только turn_info, conflict и finish")
         if ctx["kind"] == "bounds":
             if tool == "ask":
                 return self._tool_ask(ctx, args)
@@ -776,7 +794,7 @@ class Project:
                     raise EngineError("bad_diagram", f"Операция {number}: {error}") from None
                 if len(diagram["steps"]) < 2:
                     raise EngineError("bad_diagram", f"Операция {number}: в attrs.diagram нужны participants и минимум два шага steps (from, to, text)")
-                attrs, status = {"diagram": diagram}, ACCEPTED
+                attrs, status = {"diagram": diagram, "basis": check.basis(self, parent, kind)}, ACCEPTED
                 for old in self.cards(kind, parent):
                     build.append({"op": "delete_card", "id": old["id"]})
             elif kind == flow.PROBLEM:
@@ -793,6 +811,111 @@ class Project:
             ctx["created"] += created
             self._touch()
         return f"Добавлено карточек: {created}." + (f" Уже есть или отклонялись, пропущено: {', '.join(skipped)}." if skipped else "")
+
+    # ------------------------------------------------------------------ проверка согласованности перед выгрузкой
+
+    def _tool_conflict(self, ctx: dict, args: dict) -> str:
+        if ctx["asked"]:
+            raise EngineError("one_question", "За ход можно задать только один вопрос")
+        options, fixes = [], []
+        for item in (args.get("options") or [])[:4]:
+            if not isinstance(item, dict) or not _clip(item.get("title"), 200):
+                continue
+            try:
+                fixes.append(check.validate_fix(self, item.get("fix")))
+            except ValueError as error:
+                raise EngineError("bad_fix", f"Вариант «{_clip(item.get('title'), 60)}»: {error}") from None
+            options.append({"title": _clip(item.get("title"), 200), "consequence": _clip(item.get("consequence"), 200)})
+        question = _clip(args.get("question"), 400)
+        if not question or len(options) < 2:
+            raise EngineError("bad_question", "Нужен вопрос и от двух вариантов, каждый с правкой fix")
+        recommended = [i for i in (args.get("recommended") or []) if isinstance(i, int) and 1 <= i <= len(options)][:1]
+        ctx["run"].question = {"id": secrets.token_urlsafe(6), "question": question, "options": options, "recommended": recommended,
+                               "reason": _clip(args.get("reason"), 200), "single": True}
+        ctx["fixes"], ctx["asked"] = fixes, True
+        return "Вопрос задан. Заверши ход: ответ придёт в следующем ходе."
+
+    def _job_export(self, run: Run) -> None:
+        """Проверка графа с диалогом по каждому разногласию; когда разногласий нет — файл документации."""
+        sphere = self.need_sphere()
+        decided: list[tuple[str, str]] = []
+        run.total, retries = flow.CHECK_LIMIT, 0
+        while True:
+            if len(decided) >= flow.CHECK_LIMIT:
+                raise EngineError("too_many", f"После {flow.CHECK_LIMIT} правок разногласия остались. Разберите их вручную или повторите выгрузку")
+            issues = check.findings(self)
+            bounds = [str((r["data"] or {}).get("text", ""))[len(flow.BOUNDARY):] for r in self._boundary_records()]
+            note = flow.consistency(sphere["title"], bounds, check.graph_text(self), issues, decided)
+            token = secrets.token_urlsafe(24)
+            ctx = {"kind": "check", "run": run, "asked": False, "finished": False, "note": note, "fixes": []}
+            self.tokens[token] = ctx
+            run.answered.clear()
+            try:
+                result = self._request(self.settings.data["autopilot"], "check", tools.CHECK_RULES, note, token, "", False, run)
+            finally:
+                self.tokens.pop(token, None)
+            if run.stop:
+                return
+            if result.error:
+                raise EngineError("agent_error", result.error)
+            if ctx["finished"]:
+                break
+            if not ctx["asked"]:
+                retries += 1
+                if retries >= 2:
+                    raise EngineError("no_decision", "Проверка не дала ни вопроса, ни заключения. Повторите выгрузку")
+                continue
+            retries = 0
+            run.status = "asking"
+            self._touch()
+            run.answered.wait()
+            if run.stop:
+                return
+            question, choice = run.question, run.answer or {}
+            picked = [i for i in choice.get("indexes", []) if isinstance(i, int) and 1 <= i <= len(ctx["fixes"])]
+            run.question = None
+            if not picked:
+                continue
+            self._apply_fix(run, ctx["fixes"][picked[0] - 1])
+            decided.append((question["question"], question["options"][picked[0] - 1]["title"]))
+            run.done = len(decided)
+            self._touch()
+        path = self.do_export_md({})["path"]
+        run.summary = f"Разногласий нет, документация записана: {path}" if not decided else \
+            f"Исправлено разногласий: {len(decided)}. Документация записана: {path}"
+
+    def _apply_fix(self, run: Run, fix: dict) -> None:
+        do, card_id = fix["do"], fix["id"]
+        total, done = run.total, run.done                # фоновые работы помощника трогают счётчики прогона
+        if do == "remove":
+            self.do_remove({"id": card_id})
+        elif do == "choose_variant":
+            self.do_choose_variant({"id": card_id})
+        elif do == "suggest_variants":
+            self._job_variants(run, {"problems": [self.card(card_id)]})
+        elif do == "edit":
+            card = self.card(card_id)
+            op = {"op": "update_card", "id": card_id}
+            for field in ("title", "body"):
+                if field in fix:
+                    op[field] = fix[field]
+            if "importance" in fix:
+                op["attrs"] = {**(card.get("attrs") or {}), "importance": fix["importance"]}
+            self._human([op], f"Правка при проверке: {card['title']}")
+        elif do == "rebuild":
+            self._rebuild(run, self.card(card_id))
+        run.total, run.done = total, done
+
+    def _rebuild(self, run: Run, scenario: dict) -> None:
+        """Диаграммы сценария заново по принятым проблемам и выбранным решениям; если строить не из чего — убрать."""
+        sid = scenario["id"]
+        for kind, ready in ((flow.ASIS, bool(self._accepted(flow.PROBLEM, sid))), (flow.SOLUTION, bool(self._solved(sid)))):
+            if ready:
+                self._job_scenarios(run, {"kind": "asis" if kind == flow.ASIS else "solution", "scenarios": [scenario]})
+            else:
+                old = self.cards(kind, sid)
+                if old:
+                    self._human([{"op": "delete_card", "id": c["id"]} for c in old], "Диаграмма убрана: строить не из чего")
 
     # ------------------------------------------------------------------ автопилот
 

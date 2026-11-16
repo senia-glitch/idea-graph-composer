@@ -57,15 +57,11 @@ def build(project) -> str:
     out += ["", "**Границы системы** (вопрос → ответ):", ""] + ([f"- {b}" for b in bounds] or ["- не уточнялись"])
     out += ["", "**Требования пользователя:**", ""] + ([f"- {w}" for w in wishes] or ["- не заданы"]) + [""]
 
-    out += ["## 2. Конкуренты и анализ", ""]
+    out += ["## 2. Конкуренты", ""]
     competitors = project.accepted_competitors()
     if competitors:
         out += _table(["Конкурент", "Сайт", "Чем занимается"],
                       [[r["data"].get("name"), r["data"].get("url"), r["data"].get("why")] for r in competitors])
-        names = {r["key"]: r["data"].get("name", r["key"]) for r in competitors}
-        facts = [r["data"] for r in project.records("fact") if (r["data"] or {}).get("competitor") in names]
-        if facts:
-            out += _table(["Вид", "Находка", "Конкурент"], [[f.get("kind"), f.get("text"), names[f["competitor"]]] for f in facts])
     else:
         out += ["_Принятых конкурентов нет._", ""]
 

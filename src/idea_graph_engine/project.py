@@ -79,7 +79,22 @@ class Project:
         except (OSError, ValueError):
             data = {}
         rejected = data.get("rejected") if isinstance(data, dict) else {}
-        return {"rejected": {str(k): [str(x) for x in v] for k, v in (rejected or {}).items() if isinstance(v, list)}}
+        return {"rejected": {str(k): [str(x) for x in v] for k, v in (rejected or {}).items() if isinstance(v, list)},
+                "roles_confirmed": bool(data.get("roles_confirmed")) if isinstance(data, dict) else False}
+
+    @property
+    def roles_confirmed(self) -> bool:
+        """Список ролей подтверждён человеком (или автопилотом по итогам своего шага «роли»): агенты его не меняют."""
+        return bool(self._flow.get("roles_confirmed"))
+
+    def _set_confirmed(self, value: bool) -> None:
+        if self.roles_confirmed != value:
+            self._flow["roles_confirmed"] = value
+            self._save_flow()
+            self._touch()
+
+    def _roles_locked(self) -> bool:
+        return self.roles_confirmed and bool(self._components())
 
     def _save_flow(self) -> None:
         (self.dir / "flow.json").write_text(json.dumps(self._flow, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -111,7 +126,8 @@ class Project:
             scenarios = self._accepted_all(flow.SCENARIO)
             untyped = [r["title"] for r in roles if not (r.get("attrs") or {}).get("type")]
             if untyped:
-                out.append("Роли без типа считаются людьми: " + ", ".join(untyped[:5]) + ("…" if len(untyped) > 5 else ""))
+                out.append("Роли без типа считаются людьми: " + ", ".join(untyped[:5]) + ("…" if len(untyped) > 5 else "")
+                           + ". Исправьте тип кнопкой «Изменить» на шаге «Роли»")
             if scenarios and not self._components():
                 out.append("Нет компонентов системы (Сайт, Админка…): диаграммы и проверка перед выгрузкой не заработают. "
                            "Примите хотя бы один компонент на шаге «Роли»")
@@ -122,7 +138,7 @@ class Project:
 
     def state(self) -> dict:
         return {"title": self.store.title, "revision": self.store.revision, "version": self.version,
-                "run": self.run.public() if self.run else None}
+                "roles_confirmed": self.roles_confirmed, "run": self.run.public() if self.run else None}
 
     def graph(self) -> dict:
         return {**self.store.snapshot(), "layout": self.store.layout()}
@@ -315,6 +331,83 @@ class Project:
             raise EngineError("bad_type", "Тип роли: " + ", ".join(flow.ROLE_TYPES))
         return {"id": self._add_unique(flow.ROLE, d.get("title"), d.get("body"), self.need_sphere()["id"], attrs={"type": kind})}
 
+    def _role_used(self, role: dict) -> bool:
+        """Роль или компонент уже стоит в сценарии, в диаграмме вариантов использования или в диаграмме последовательности."""
+        name = role["title"].lower()
+        snap = self._snap()
+        if any(e["to"] == role["id"] and e["kind"] == flow.PARTICIPATES for e in snap["edges"]):
+            return True
+        for card in snap["cards"]:
+            attrs = card.get("attrs") or {}
+            for case in (attrs.get("usecase") or {}).get("cases", []):
+                if any(str(a).lower() == name for a in case.get("actors", [])):
+                    return True
+            diagram = attrs.get("diagram") or {}
+            if any(str(p).lower() == name for p in diagram.get("participants", [])):
+                return True
+            if any(name in (str(s.get("from", "")).lower(), str(s.get("to", "")).lower()) for s in diagram.get("steps", [])):
+                return True
+        return False
+
+    def do_edit_role(self, d: dict) -> dict:
+        """Ручная правка роли или компонента: название, описание, тип. Имя и «компонент / не компонент» нельзя менять там, где роль
+        уже стоит в сценариях и диаграммах: иначе они сломаются."""
+        role = self.card(str(d.get("id") or ""))
+        if role["kind"] != flow.ROLE:
+            raise EngineError("bad_kind", "Правится только роль или компонент")
+        used = self._role_used(role)
+        op: dict = {"op": "update_card", "id": role["id"]}
+        if "title" in d:
+            title = _clip(d.get("title"), 200)
+            if not title:
+                raise EngineError("empty", "Название не может быть пустым")
+            if title != role["title"]:
+                if used:
+                    raise EngineError("role_used", f"«{role['title']}» уже есть в сценариях и диаграммах: переименование их сломает. "
+                                      "Измените описание или тип, либо добавьте новую роль и удалите эту")
+                if any(c["id"] != role["id"] and c["title"].lower() == title.lower() for c in self.cards(flow.ROLE)):
+                    raise EngineError("duplicate", f"«{title}» уже есть")
+                op["title"] = title
+        if "body" in d:
+            body = str(d.get("body") or "").strip()[:4000]
+            if body != (role.get("body") or ""):
+                op["body"] = body
+        if "type" in d:
+            kind = str(d.get("type") or "").strip().lower()
+            if kind not in flow.ROLE_TYPES:
+                raise EngineError("bad_type", "Тип роли: " + ", ".join(flow.ROLE_TYPES))
+            old = self._role_type(role)
+            if kind != old:
+                if used and (kind == flow.COMPONENT_TYPE) != (old == flow.COMPONENT_TYPE):
+                    raise EngineError("role_used", f"«{role['title']}» уже стоит в сценариях и диаграммах: менять «компонент» на роль "
+                                      "(и наоборот) нельзя. Между «человек» и «внешняя система» менять можно")
+                op["attrs"] = {"type": kind}
+        if len(op) > 2:
+            self._human([op], f"Правка роли: {role['title']}")
+        return {}
+
+    def do_confirm_roles(self, d: dict) -> dict:
+        """Подтвердить список ролей: агенты его больше не меняют, пока вы сами не попросите предложить ещё
+        или не запустите «Улучшить уже есть»."""
+        pending = [r["title"] for r in self.cards(flow.ROLE) if r["status"] == PROPOSED]
+        if pending:
+            raise EngineError("pending_roles", f"Есть роли, которые ждут решения ({len(pending)}): " + ", ".join(pending[:5])
+                              + ". Примите или отклоните их")
+        self._need_components()
+        self._set_confirmed(True)
+        return {}
+
+    def _sync_scenario_roles(self, scenario_id: str, diagram: dict, author: str) -> None:
+        """Люди и внешние системы из диаграммы сценария становятся его ролями: «Роли» сценария совпадают с тем, кто действует."""
+        have = {r["id"] for r in self.roles_of(scenario_id)}
+        names = {str(p).lower() for p in diagram.get("participants", [])}
+        names |= {str(s.get(k, "")).lower() for s in diagram.get("steps", []) for k in ("from", "to")}
+        ops = [{"op": "add_edge", "from": scenario_id, "to": r["id"], "kind": flow.PARTICIPATES}
+               for r in self.cards(flow.ROLE) if r["title"].lower() in names and r["status"] == ACCEPTED
+               and self._role_type(r) != flow.COMPONENT_TYPE and r["id"] not in have]
+        if ops:
+            self.store.apply(ops, author, note="Роли сценария по диаграмме")
+
     def do_add_scenario(self, d: dict) -> dict:
         """Свой сценарий: название и роли; диаграмма вариантов использования строится из них."""
         sphere = self.need_sphere()
@@ -363,6 +456,7 @@ class Project:
             prefix = "Как есть" if kind == flow.ASIS else "Решение"
             self._human([{"op": "add_card", "kind": kind, "title": f"{prefix}: {scenario['title']}"[:200], "parent": scenario["id"],
                           "attrs": {"diagram": diagram}}])
+        self._sync_scenario_roles(scenario["id"], diagram, HUMAN)
         return {}
 
     # ---- банк знаний
@@ -418,6 +512,8 @@ class Project:
             if self.run and self.run.status in ("running", "asking"):
                 raise EngineError("busy", "Уже идёт работа агентов")
             plan = self._plan(kind, [str(i) for i in (ids or [])], redo)
+            if kind == "roles":
+                self._set_confirmed(False)         # вы сами просите предложить ещё: список снова открыт, потом подтвердите
             run = Run(kind, plan["title"])
             run.total = plan.get("total", 1)
             run.improve = kind == "autopilot" and redo
@@ -860,7 +956,7 @@ class Project:
             raise EngineError("invalid_ops", "Ожидался непустой список операций")
         sphere = self.need_sphere()
         roles = {r["title"].lower(): r for r in self.cards(flow.ROLE)}
-        build, skipped = [], []
+        build, skipped, synced = [], [], []
         for number, op in enumerate(ops, 1):
             if not isinstance(op, dict) or op.get("op") != "add_card":
                 raise EngineError("bad_op", f"Операция {number}: разрешён только add_card")
@@ -911,9 +1007,12 @@ class Project:
                 if broken:
                     raise EngineError("bad_diagram", f"Операция {number}: " + "; ".join(broken))
                 attrs, status = {"diagram": diagram, "basis": check.basis(self, parent, kind)}, ACCEPTED
+                synced.append((parent, diagram))
                 for old in self.cards(kind, parent):
                     build.append({"op": "delete_card", "id": old["id"]})
             elif kind == flow.ROLE:
+                if self.roles_confirmed:
+                    raise EngineError("roles_locked", "Список ролей подтверждён человеком и в этом прогоне не меняется")
                 role_type = str(raw.get("type") or "").strip().lower()
                 if role_type not in flow.ROLE_TYPES:
                     raise EngineError("bad_type", f"Операция {number}: у роли обязателен attrs.type — один из: " + ", ".join(flow.ROLE_TYPES))
@@ -936,6 +1035,8 @@ class Project:
                 raise EngineError(error.code, error.message) from None
             created = len(result["ids"])
             ctx["created"] += created
+            for scenario_id, diagram in synced:
+                self._sync_scenario_roles(scenario_id, diagram, AGENT)
             self._touch()
         return f"Добавлено карточек: {created}." + (f" Уже есть или отклонялись, пропущено: {', '.join(skipped)}." if skipped else "")
 
@@ -1263,29 +1364,19 @@ class Project:
             self._job_analysis(run, plan)
         if run.stop:
             return
-        steps = [("roles", "роли", flow.ROLE,
-                  "Принимай полный строгий список имён: люди, внешние системы, разрешённые границами, и компоненты системы (минимум один). "
-                  "Ничего лишнего, что границы не требуют.")]
+        if self._roles_locked() and not run.improve:
+            run.notes.append("Список ролей подтверждён вами: автопилот его не меняет")
+        else:
+            self._pilot_roles(run)                                    # единый список имён определяется до сценариев и диаграмм
+            if run.stop:
+                return
         if not run.each:
-            steps.append(("scenarios", "сценарии", flow.SCENARIO, SCENARIO_RULE))
-        for kind, label, card_kind, rule in steps:
-            self._stage(run, label)
-            self._step_cards(run, label, card_kind, None, rule, lambda kind=kind: self._job_global(run, kind))
+            self._stage(run, "сценарии")
+            self._step_cards(run, "сценарии", flow.SCENARIO, None, SCENARIO_RULE, lambda: self._job_global(run, "scenarios"))
             if run.stop:
                 return
-            if not self._accepted_all(card_kind):
-                raise EngineError("pilot_stuck", f"Автопилот не принял ни одной карточки «{label}»: добавьте свои или повторите")
-        if not self._components():                                    # единый список имён определяется до сценариев и диаграмм
-            self._stage(run, "компоненты системы")
-            self._job_global(run, "roles")
-            if run.stop:
-                return
-            self._decide_cards(run, "роли и компоненты", flow.ROLE, None,
-                               "Принимай компоненты системы (Сайт, Админка…) и недостающие роли строго по границам; минимум один компонент.")
-            if run.stop:
-                return
-            if not self._components():
-                raise EngineError("pilot_stuck", "Автопилот не определил компоненты системы. Добавьте их на шаге «Роли» вручную")
+            if not self._accepted_all(flow.SCENARIO):
+                raise EngineError("pilot_stuck", "Автопилот не принял ни одной карточки «сценарии»: добавьте свои или повторите")
         if run.each:
             count = self._each_scenario(run)
             if not run.stop:
@@ -1298,6 +1389,30 @@ class Project:
             self._scenario_pilot(run, scenario, f"{number}/{len(scenarios)} «{scenario['title']}»")
         if not run.stop:
             run.summary = f"Автопилот ({mode}) прошёл цепочку: сценариев {len(scenarios)}"
+
+    def _pilot_roles(self, run: Run) -> None:
+        """Шаг «роли» автопилота: единый список ролей и компонентов; по его итогам список считается подтверждённым и дальше не меняется."""
+        self._set_confirmed(False)                                    # пока идёт шаг, список открыт
+        self._stage(run, "роли")
+        self._step_cards(run, "роли", flow.ROLE, None,
+                         "Принимай полный строгий список имён: люди, внешние системы, разрешённые границами, и компоненты системы (минимум один). "
+                         "Ничего лишнего, что границы не требуют.", lambda: self._job_global(run, "roles"))
+        if run.stop:
+            return
+        if not self._accepted_all(flow.ROLE):
+            raise EngineError("pilot_stuck", "Автопилот не принял ни одной карточки «роли»: добавьте свои или повторите")
+        if not self._components():
+            self._stage(run, "компоненты системы")
+            self._job_global(run, "roles")
+            if run.stop:
+                return
+            self._decide_cards(run, "роли и компоненты", flow.ROLE, None,
+                               "Принимай компоненты системы (Сайт, Админка…) и недостающие роли строго по границам; минимум один компонент.")
+            if run.stop:
+                return
+            if not self._components():
+                raise EngineError("pilot_stuck", "Автопилот не определил компоненты системы. Добавьте их на шаге «Роли» вручную")
+        self._set_confirmed(True)
 
     def _each_scenario(self, run: Run) -> int:
         """Режим «по сценариям»: каждый сценарий целиком (проблемы → «как есть» → решения → «решение»), и только потом следующий.

@@ -111,7 +111,7 @@ def _issues(project) -> list[dict]:
         for kind in (flow.ASIS, flow.SOLUTION):
             for card in project.cards(kind, scenario["id"])[:1]:
                 in_diagrams |= set(((card.get("attrs") or {}).get("diagram") or {}).get("participants") or [])
-    for role in project._accepted_all(flow.ROLE):
+    for role in [] if project.roles_confirmed else project._accepted_all(flow.ROLE):       # подтверждённый список ролей не оспаривается
         if not role.get("body"):
             add("empty", f"Роль {ref(role)}: нет описания", role["id"])
         if project._role_type(role) == flow.COMPONENT_TYPE:
@@ -133,7 +133,8 @@ def graph_text(project) -> str:
 
 
 def _graph_text(project) -> str:
-    out = ["Роли и компоненты (единое пространство имён участников диаграмм):"]
+    out = ["Роли и компоненты (единое пространство имён участников диаграмм"
+           + ("; список подтверждён человеком — его не оценивай и в отчёт не включай):" if project.roles_confirmed else "):")]
     roles = project._accepted_all(flow.ROLE)
     out += [f"- {ref(r)} [{project._role_type(r)}]: {r.get('body') or 'нет описания'}" for r in roles] or ["- нет"]
     for scenario in project._accepted_all(flow.SCENARIO):
@@ -166,6 +167,8 @@ def validate_fix(project, fix) -> dict:
     except Exception:  # noqa: BLE001 — id придумал агент
         raise ValueError(f"нет карточки с id «{fix.get('id')}»: бери id только из графа") from None
     do, kind = fix["do"], card["kind"]
+    if kind == flow.ROLE and do in ("remove", "edit") and project.roles_confirmed:
+        raise ValueError(f"список ролей подтверждён человеком: {ref(card)} не меняется")
     allowed = {"remove": (flow.ROLE, flow.SCENARIO, flow.PROBLEM, flow.VARIANT),
                "choose_variant": (flow.VARIANT,), "suggest_variants": (flow.PROBLEM,),
                "edit": (flow.ROLE, flow.SCENARIO, flow.PROBLEM, flow.VARIANT), "rebuild": (flow.SCENARIO,)}[do]
@@ -209,6 +212,9 @@ def parse_report(project, raw: dict, bounds: list[str], found: list[dict]) -> tu
                 errors.append(f"items[{number}]: нет карточки «{i}», бери id только из графа")
         if len(cards) != want or len(set(ids)) != want:
             errors.append(f"items[{number}] ({item['kind']}): нужно ровно {want} разных карточки в cards")
+            continue
+        if project.roles_confirmed and any(c["kind"] == flow.ROLE for c in cards):
+            errors.append(f"items[{number}]: список ролей подтверждён человеком, роли не оцениваются и в отчёт не входят: убери роль из пункта")
             continue
         if any(c["kind"] not in (flow.SCENARIO, flow.PROBLEM, flow.VARIANT, flow.ROLE) for c in cards):
             errors.append(f"items[{number}]: можно указывать только роли, сценарии, проблемы и варианты")

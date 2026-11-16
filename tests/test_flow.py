@@ -172,6 +172,13 @@ def test_whole_chain(make):
     p.start("solution")                                                             # перестроение заменяет, а не дублирует
     wait(p)
     assert len(kinds(p, "решение")) == 1
+    path = p.act("export_md", {})["path"]                                           # выгрузка документации в папку проекта
+    text = open(path, encoding="utf-8").read()
+    assert path.endswith("Документация.md")
+    for part in ("## 1. Сфера", "парикмахерская", "Нужна интеграция с 1С", "## 3. Роли", "### ", "Не дозвониться",
+                 "Запись на сайте", "**Как есть", "Как будет (решение)", "| № | От кого | Кому |"):
+        assert part in text, part
+    assert text == open(p.act("export_md", {})["path"], encoding="utf-8").read()    # повторная выгрузка даёт тот же файл
 
 
 def test_human_edits_and_cascades(make):

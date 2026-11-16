@@ -16,7 +16,7 @@ from pathlib import Path
 
 from idea_graph_core import ACCEPTED, HUMAN, PROPOSED, GraphError, Store, normalize_url
 
-from . import diagrams, flow, tools
+from . import diagrams, export, flow, tools
 from .agents import TurnRequest, TurnResult
 from .errors import EngineError
 
@@ -315,6 +315,13 @@ class Project:
                 data[field] = _clip(d[field], 600)
         self.bank.update(record["id"], HUMAN, data=data)
         return {}
+
+    def do_export_md(self, d: dict) -> dict:
+        """Выгрузить документацию проекта в .md в папке проекта (файл перезаписывается)."""
+        self.need_sphere()
+        path = self.folder / export.FILE_NAME
+        path.write_text(export.build(self), encoding="utf-8")
+        return {"path": str(path)}
 
     def do_bank_remove(self, d: dict) -> dict:
         """Удалить запись; у конкурента вместе с ним уходят его факты, а сайт больше не предлагается."""

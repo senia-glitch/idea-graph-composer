@@ -13,8 +13,10 @@ def build_state(p):
     p.act("set_sphere", {"title": "парикмахерская"})
     p.act("bank_add", {"type": "requirement", "text": "Граница системы: Нужен ли платёжный модуль? → Нет"})
     p.act("add_role", {"title": "Клиент", "body": "записывается"})
+    p.act("add_role", {"title": "Администратор", "body": "принимает"})
+    p.act("add_role", {"title": "Система", "body": "сайт", "type": "компонент"})
     p.act("add_role", {"title": "Лишний"})
-    p.act("add_scenario", {"title": "Запись", "body": "клиент записывается", "roles": ["Клиент"]})
+    p.act("add_scenario", {"title": "Запись", "body": "клиент записывается", "roles": ["Клиент", "Администратор"]})
     for card in p.store.snapshot()["cards"]:
         if card["kind"] in ("роль", "сценарий"):
             p.act("accept", {"id": card["id"]})

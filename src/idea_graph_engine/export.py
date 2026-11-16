@@ -70,8 +70,9 @@ def build(project) -> str:
         out += ["_Принятых конкурентов нет._", ""]
 
     roles = project._accepted_all(flow.ROLE)
-    out += ["## 3. Роли", ""]
-    out += _table(["Роль", "Что делает"], [[r["title"], r.get("body")] for r in roles]) or ["_Принятых ролей нет._", ""]
+    out += ["## 3. Роли и компоненты системы", "", "Единое пространство имён: участники всех диаграмм ниже — только эти имена.", ""]
+    out += _table(["Имя", "Тип", "Что делает"], [[r["title"], project._role_type(r), r.get("body")] for r in roles]) \
+        or ["_Принятых ролей нет._", ""]
 
     out += ["## 4. Сценарии", ""]
     scenarios = project._accepted_all(flow.SCENARIO)

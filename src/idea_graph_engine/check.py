@@ -77,6 +77,14 @@ def issues(project) -> list[dict]:
                 if not variant.get("body"):
                     add("empty", f"Решение {ref(variant)} проблемы «{problem['title']}»: нет описания", variant["id"], sid)
         asis = project.cards(flow.ASIS, sid)
+        names = project._role_names()
+        for label, cards_ in (("как есть", asis), ("как будет", project.cards(flow.SOLUTION, sid))):
+            for card in cards_[:1]:
+                parts = ((card.get("attrs") or {}).get("diagram") or {}).get("participants") or []
+                unknown = [x for x in parts if x not in names]
+                if unknown:
+                    add("diagram", f"Сценарий {ref(scenario)}: в диаграмме «{label}» участники вне единого списка имён "
+                                   f"({', '.join(unknown)}) — нужно перестроить", sid, sid)
         if problems and not asis:
             add("diagram", f"Сценарий {ref(scenario)}: есть принятые проблемы, но нет диаграммы «как есть»", sid, sid)
         if asis and _pains(asis[0]) != {p["title"].strip().lower() for p in problems}:
@@ -92,10 +100,18 @@ def issues(project) -> list[dict]:
                 if saved and saved != basis(project, sid, kind):
                     add("diagram", f"Сценарий {ref(scenario)}: диаграмма «{'как есть' if kind == flow.ASIS else 'как будет'}» построена "
                                    "по старым проблемам или решениям — нужно перестроить", sid, sid)
+    in_diagrams: set[str] = set()
+    for scenario in project._accepted_all(flow.SCENARIO):
+        for kind in (flow.ASIS, flow.SOLUTION):
+            for card in project.cards(kind, scenario["id"])[:1]:
+                in_diagrams |= set(((card.get("attrs") or {}).get("diagram") or {}).get("participants") or [])
     for role in project._accepted_all(flow.ROLE):
         if not role.get("body"):
             add("empty", f"Роль {ref(role)}: нет описания", role["id"])
-        if role["id"] not in used:
+        if project._role_type(role) == flow.COMPONENT_TYPE:
+            if in_diagrams and role["title"] not in in_diagrams:
+                add("unused_role", f"Компонент {ref(role)}: не участвует ни в одной диаграмме", role["id"])
+        elif role["id"] not in used:
             add("unused_role", f"Роль {ref(role)}: не участвует ни в одном принятом сценарии", role["id"])
     return out
 
@@ -106,9 +122,9 @@ def findings(project) -> list[str]:
 
 def graph_text(project) -> str:
     """Граф проекта для чтения агентом: что принято, с id карточек и порядковыми номерами создания."""
-    out = ["Роли:"]
+    out = ["Роли и компоненты (единое пространство имён участников диаграмм):"]
     roles = project._accepted_all(flow.ROLE)
-    out += [f"- {ref(r)}: {r.get('body') or 'нет описания'}" for r in roles] or ["- нет"]
+    out += [f"- {ref(r)} [{project._role_type(r)}]: {r.get('body') or 'нет описания'}" for r in roles] or ["- нет"]
     for scenario in project._accepted_all(flow.SCENARIO):
         sid = scenario["id"]
         out += ["", f"Сценарий {ref(scenario)}: {scenario.get('body') or 'нет описания'}",

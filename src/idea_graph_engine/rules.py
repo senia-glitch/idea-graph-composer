@@ -28,10 +28,28 @@ def question_errors(question: str, titles: list[str]) -> list[str]:
     return out
 
 
+def canonical_names(diagram: dict, names: list[str]) -> dict:
+    """Имя участника, совпавшее со списком с точностью до регистра и пробелов, заменяется на имя из списка."""
+    from . import diagrams
+
+    canon = {" ".join(n.split()).lower(): n for n in names}
+    fix = lambda value: canon.get(" ".join(str(value).split()).lower(), value)       # noqa: E731
+    return diagrams.normalize({"participants": [fix(p) for p in diagram["participants"]],
+                               "steps": [{**s, "from": fix(s["from"]), "to": fix(s["to"])} for s in diagram["steps"]]})
+
+
+def participant_errors(diagram: dict, names: list[str]) -> list[str]:
+    """Единое пространство имён: участник диаграммы — только роль или компонент из списка."""
+    if not names:
+        return ["не определены роли и компоненты: сначала нужен список имён"]
+    unknown = [p for p in diagram["participants"] if p not in names]
+    return [f"участники вне единого списка имён: {', '.join(unknown)}; допустимы только: {', '.join(names)}"] if unknown else []
+
+
 def diagram_errors(kind: str, diagram: dict, project, scenario_id: str) -> list[str]:
     """Диаграмма «как есть» или «решение» должна точно соответствовать принятым проблемам и выбранным решениям."""
     steps = diagram["steps"]
-    out = []
+    out = participant_errors(diagram, project._role_names())
     if len(steps) > MAX_STEPS:
         out.append(f"шагов {len(steps)}, нужно не больше {MAX_STEPS}: объедини мелкие")
     for number, step in enumerate(steps, 1):

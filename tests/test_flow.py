@@ -5,6 +5,7 @@ import re
 import pytest
 from conftest import wait
 
+from idea_graph_engine import flow
 from idea_graph_engine.errors import EngineError
 
 ASIS = {"participants": ["Клиент", "Администратор"], "steps": [
@@ -18,12 +19,13 @@ TOBE = {"participants": ["Клиент", "Система"], "steps": [
 def pilot(note, call):
     """Автопилот: два вопроса о границах, затем принимает всё, а проблемы и решения — только первое."""
     if "уточнить границы" in note:
-        if "Можно задать ещё не более 15" in note:
+        if "Можно задать ещё не более 70" in note:
             call("ask", question="Нужен ли платёжный модуль?", options=[{"title": "Нет"}, {"title": "Да"}])
-        elif "Можно задать ещё не более 14" in note:
+        elif "Можно задать ещё не более 69" in note:
             call("ask", question="Какие каналы связи?", options=[{"title": "Сайт"}, {"title": "Бот"}])
         else:
-            call("finish", summary="границ достаточно")
+            assert call("finish", summary="рано").startswith("ОТКАЗ topics")                 # без статуса по темам закончить нельзя
+            call("finish", summary="границ достаточно", topics={t: "решено" for t in flow.BOUND_TOPICS})
         return
     if "Режим «улучшить»" in note:
         rows = re.findall(r"- id=(\S+?): (\[принято\] )?(.*)", note)
@@ -49,12 +51,15 @@ def script(model, note, call, request):
                 {"kind": "конкурент", "title": "Салон А", "description": "стрижки", "data": {"url": "https://a.ru"}, "sources": ["https://a.ru"]},
                 {"kind": "конкурент", "title": "Салон Б", "description": "стрижки", "data": {"url": "https://www.b.ru/"}, "sources": ["https://b.ru"]}])
         return
-    if "предложить роли" in note:
+    if "определить ВСЕ роли" in note:
         if "Ответ человека" not in note and "Автоматический режим" not in note:
             call("ask", question="Включать ли внешние системы?", options=[{"title": "Да"}, {"title": "Нет"}], recommended=[2])
             return
-        call("graph_apply", ops=[{"op": "add_card", "kind": "роль", "title": "Клиент", "body": "записывается"},
-                                 {"op": "add_card", "kind": "роль", "title": "Администратор"}])
+        no_type = call("graph_apply", ops=[{"op": "add_card", "kind": "роль", "title": "Робот"}])
+        assert no_type.startswith("ОТКАЗ bad_type")                                         # у роли обязателен тип
+        call("graph_apply", ops=[{"op": "add_card", "kind": "роль", "title": "Клиент", "body": "записывается", "attrs": {"type": "человек"}},
+                                 {"op": "add_card", "kind": "роль", "title": "Администратор", "attrs": {"type": "человек"}},
+                                 {"op": "add_card", "kind": "роль", "title": "Система", "body": "сайт", "attrs": {"type": "компонент"}}])
     elif "предложить сценарии" in note:
         bad = call("graph_apply", ops=[{"op": "add_card", "kind": "сценарий", "title": "Плохой",
                                         "attrs": {"usecase": {"cases": [{"name": "х", "actors": ["Робот"]}]}}}])
@@ -123,7 +128,7 @@ def test_whole_chain(make):
     assert "Ответ человека на твой вопрос" in p.adapter.requests[-1].note and "Нет" in p.adapter.requests[-1].note
     assert "Онлайн-запись" in p.adapter.requests[-2].note                            # помощник видит банк
     roles = kinds(p, "роль")
-    assert [r["status"] for r in roles] == ["proposed", "proposed"]
+    assert [r["status"] for r in roles] == ["proposed", "proposed", "proposed"]
     for r in roles:
         p.act("accept", {"id": r["id"]})
     p.act("add_role", {"title": "Мастер"})
@@ -242,7 +247,8 @@ def test_autopilot(make):
     assert "Нужен ли платёжный модуль?" in p.adapter.requests[0].note or any("Граница системы" in r.note for r in p.adapter.requests)
     # цепочка пройдена до конца: всё принято агентом
     assert sorted(r["data"]["state"] for r in p.records("competitor")) == ["accepted", "accepted"]
-    assert [c["status"] for c in kinds(p, "роль")] == ["accepted", "accepted"]
+    assert [c["status"] for c in kinds(p, "роль")] == ["accepted", "accepted", "accepted"]
+    assert [c["title"] for c in p._components()] == ["Система"]                       # компонент определён до сценариев и диаграмм
     scenario = kinds(p, "сценарий")[0]
     assert scenario["status"] == "accepted"
     assert [c["title"] for c in kinds(p, "проблема")] == ["Не дозвониться"]            # вторая отклонена
@@ -278,7 +284,8 @@ def test_autopilot_agree_keeps_existing(make):
     assert run.status == "done", run.error
     assert "Режим: довести до согласования" in " ".join(run.notes)
     notes = [r.note for r in p.adapter.requests]
-    assert not any("предложить роли" in n for n in notes)                                   # роли есть: заново не просили
+    assert sum("определить ВСЕ роли" in n for n in notes) == 1                                  # нет компонентов: один раз просили определить список
+    assert [c["title"] for c in p._components()] == ["Система"]
     assert not any(r.model.startswith("r") and "Найди" in r.note for r in p.adapter.requests)  # конкурент есть: поиск не нужен
     assert kinds(p, "решение")                                                               # а недостающее достроено
 

@@ -366,7 +366,7 @@ class Project:
     def _plan(self, kind: str, ids: list[str], redo: bool) -> dict:
         sphere = self.need_sphere()
         if kind in ("export", "export_auto"):
-            return {"title": "Проверка согласованности перед выгрузкой…" if kind == "export" else "Автоматическая проверка и правка графа…",
+            return {"title": "Проверка графа перед выгрузкой…" if kind == "export" else "Автоматическая проверка и правка графа…",
                     "kind": kind}
         if kind == "autopilot":
             return {"title": "Автопилот: уточняет границы системы…", "kind": kind}
@@ -677,7 +677,7 @@ class Project:
         if ctx["kind"] == "bounds":
             return tools.BOUNDS_TOOLS
         if ctx["kind"] == "check":
-            return tools.AUTO_CHECK_TOOLS if ctx["auto"] else tools.CHECK_TOOLS
+            return tools.CHECK_TOOLS
         if ctx["kind"] == "pilot":
             return tools.PILOT_TOOLS
         return [x for x in tools.HELPER_TOOLS if x["name"] != "ask"] if ctx.get("auto") else tools.HELPER_TOOLS
@@ -699,18 +699,9 @@ class Project:
                                "remove": [str(i) for i in rm if i is not None] if isinstance(rm, list) else []}
             return "Принято. Заверши ход."
         if ctx["kind"] == "check":
-            if tool == "conflict" and not ctx["auto"]:
-                return self._tool_conflict(ctx, args)
-            if tool == "resolve" and ctx["auto"]:
-                return self._tool_resolve(ctx, args)
-            if tool == "finish":
-                left = check.findings(self)
-                if left:
-                    raise EngineError("not_finished", "Ещё не разрешено проверкой кода: " + "; ".join(left[:6]) +
-                                      (". Исправь это правками resolve." if ctx["auto"] else ". Задай вопрос по первому из них."))
-                ctx["finished"] = True
-                return "Принято."
-            raise EngineError("unknown_tool", "Здесь есть только turn_info, " + ("resolve" if ctx["auto"] else "conflict") + " и finish")
+            if tool == "report":
+                return self._tool_check_report(ctx, args)
+            raise EngineError("unknown_tool", "Здесь есть только turn_info и report")
         if ctx["kind"] == "bounds":
             if tool == "ask":
                 return self._tool_ask(ctx, args)
@@ -845,127 +836,138 @@ class Project:
 
     # ------------------------------------------------------------------ проверка согласованности перед выгрузкой
 
-    def _tool_conflict(self, ctx: dict, args: dict) -> str:
-        if ctx["asked"]:
-            raise EngineError("one_question", "За ход можно задать только один вопрос")
-        options, fixes = [], []
-        for item in (args.get("options") or [])[:4]:
-            if not isinstance(item, dict) or not _clip(item.get("title"), 200):
-                continue
-            try:
-                fixes.append(check.validate_fix(self, item.get("fix")))
-            except ValueError as error:
-                raise EngineError("bad_fix", f"Вариант «{_clip(item.get('title'), 60)}»: {error}") from None
-            options.append({"title": _clip(item.get("title"), 400), "consequence": ""})
-        question = _clip(args.get("question"), 600)
-        if not question or len(options) < 2:
-            raise EngineError("bad_question", "Нужен вопрос и от двух вариантов, каждый с правкой fix")
-        long = rules.question_errors(question, [o["title"] for o in options])
-        if long:
-            raise EngineError("too_long", "; ".join(long))
-        recommended = [i for i in (args.get("recommended") or []) if isinstance(i, int) and 1 <= i <= len(options)][:1]
-        ctx["run"].question = {"id": secrets.token_urlsafe(6), "question": question, "options": options, "recommended": recommended,
-                               "reason": "", "single": True}
-        ctx["fixes"], ctx["asked"] = fixes, True
-        return "Вопрос задан. Заверши ход: ответ придёт в следующем ходе."
+    def _tool_check_report(self, ctx: dict, args: dict) -> str:
+        report, errors = check.parse_report(self, args, ctx["bounds"], ctx["found"])
+        if errors:
+            raise EngineError("bad_report", "Отчёт не принят, исправь и вызови report снова: " + "; ".join(errors[:8]))
+        ctx["report"] = report
+        return "Отчёт принят. Заверши ход."
 
-    def _tool_resolve(self, ctx: dict, args: dict) -> str:
-        """Автоматический режим: агент сам присылает правки списком; ошибка в любой — отказ всему списку."""
-        raw = args.get("fixes")
-        if not isinstance(raw, list) or not raw:
-            raise EngineError("bad_fixes", "Нужен непустой список правок fixes")
-        fixes = []
-        for number, item in enumerate(raw[:30], 1):
-            try:
-                fixes.append(check.validate_fix(self, item))
-            except ValueError as error:
-                raise EngineError("bad_fix", f"Правка {number}: {error}") from None
-        ctx["fixes"] = fixes
-        return "Принято, правки применяются. Заверши ход."
-
-    def _job_export(self, run: Run) -> None:
-        """Проверка графа с диалогом по каждому разногласию; когда разногласий нет — файл документации."""
-        sphere = self.need_sphere()
-        auto = run.kind == "export_auto"                 # автоматический режим: агент сам правит граф, вопросов не задаёт
-        decided: list[tuple[str, str]] = []
-        run.total, retries, rounds = flow.CHECK_LIMIT, 0, 0
-        while True:
-            if len(decided) >= flow.CHECK_LIMIT:
-                raise EngineError("too_many", f"После {flow.CHECK_LIMIT} правок разногласия остались. Разберите их вручную или повторите выгрузку")
-            if auto and rounds >= flow.AUTO_ROUNDS:
-                raise EngineError("too_many", f"После {flow.AUTO_ROUNDS} кругов автоматических правок разногласия остались: "
-                                  + "; ".join(check.findings(self)[:3]) + ". Запустите ещё раз или проверьте с вопросами")
-            issues = check.findings(self)
-            bounds = [str((r["data"] or {}).get("text", ""))[len(flow.BOUNDARY):] for r in self._boundary_records()]
-            note = flow.consistency(sphere["title"], bounds, check.graph_text(self), issues, decided, auto)
-            token = secrets.token_urlsafe(24)
-            ctx = {"kind": "check", "run": run, "asked": False, "finished": False, "note": note, "fixes": [], "auto": auto}
-            self.tokens[token] = ctx
-            run.answered.clear()
-            try:
-                result = self._request(self.settings.data["autopilot"], "check", tools.AUTO_CHECK_RULES if auto else tools.CHECK_RULES,
-                                       note, token, "", False, run)
-            finally:
-                self.tokens.pop(token, None)
-            if run.stop:
-                return
-            if result.error:
-                raise EngineError("agent_error", result.error)
-            if ctx["finished"]:
+    def _checker_slot(self, run: Run) -> dict:
+        """Независимый проверяющий: модель из настройки «Проверяющий»; совпадение с той, что строит, — предупреждение."""
+        slot = self.settings.data.get("checker") or {}
+        for name, label in (("helper", "Помощник"), ("autopilot", "Автопилот")):
+            other = self.settings.data.get(name) or {}
+            if (other.get("agent"), other.get("model")) == (slot.get("agent"), slot.get("model")):
+                run.notes.append(f"Внимание: проверяющий совпадает с «{label}», проверка не независима. Выберите другую модель в «Настройках».")
                 break
-            if auto:
-                if not ctx["fixes"]:
-                    retries += 1
-                    if retries >= 2:
-                        raise EngineError("no_decision", "Проверка не дала ни правок, ни заключения. Повторите выгрузку")
-                    continue
-                retries, rounds = 0, rounds + 1
-                self._apply_all(run, ctx["fixes"], decided)
-                run.done = len(decided)
-                self._touch()
-                continue
-            if not ctx["asked"]:
-                retries += 1
-                if retries >= 2:
-                    raise EngineError("no_decision", "Проверка не дала ни вопроса, ни заключения. Повторите выгрузку")
-                continue
-            retries = 0
+        return slot
+
+    def _exists(self, card_id: str) -> bool:
+        try:
+            self.store.card(card_id)
+            return True
+        except GraphError:
+            return False
+
+    def _checker_turn(self, run: Run, slot: dict, sphere: dict, bounds: list[str], found: list[dict]) -> dict | None:
+        """Один вызов проверяющего на весь граф. Возвращает отчёт (None — остановлено)."""
+        note = flow.verify(sphere["title"], bounds, check.graph_text(self), found)
+        token = secrets.token_urlsafe(24)
+        ctx = {"kind": "check", "run": run, "note": note, "report": None, "bounds": bounds, "found": found}
+        self.tokens[token] = ctx
+        run.title = "Проверяющий читает граф…"
+        self._touch()
+        try:
+            result = self._request(slot, "check", tools.CHECK_RULES, note, token, "", False, run)
+        finally:
+            self.tokens.pop(token, None)
+        if run.stop:
+            return None
+        if result.error:
+            raise EngineError("agent_error", result.error)
+        if ctx["report"] is None:
+            raise EngineError("no_report", "Проверяющий не сдал отчёт. Повторите выгрузку")
+        return ctx["report"]
+
+    def _ask_item(self, run: Run, item: dict, number: int, total: int) -> int | None:
+        """Вопрос человеку по одному пункту; возвращает номер выбранного варианта (None — остановлено)."""
+        while True:
+            run.answered.clear()
+            run.question = {"id": secrets.token_urlsafe(6), "question": item["question"], "single": True, "reason": "",
+                            "options": [{"title": o["title"], "consequence": ""} for o in item["options"]],
+                            "recommended": [item["recommended"]]}
+            run.title = f"Проверка: вопрос {number} из {total}"
             run.status = "asking"
             self._touch()
             run.answered.wait()
+            choice = run.answer or {}
+            run.question = None
+            if run.stop:
+                return None
+            picked = [i for i in choice.get("indexes", []) if isinstance(i, int) and 1 <= i <= len(item["options"])]
+            if picked:
+                return picked[0]
+
+    def _fix_diagrams(self, run: Run) -> None:
+        """В конце, после всех правок: диаграммы без вопросов перестраиваются помощником по итоговым проблемам и решениям."""
+        todo = list(dict.fromkeys(i["scenario"] for i in check.issues(self) if i["code"] == "diagram"))
+        for index, sid in enumerate(todo, 1):
             if run.stop:
                 return
-            question, choice = run.question, run.answer or {}
-            picked = [i for i in choice.get("indexes", []) if isinstance(i, int) and 1 <= i <= len(ctx["fixes"])]
-            run.question = None
-            if not picked:
-                continue
-            self._apply_fix(run, ctx["fixes"][picked[0] - 1])
-            decided.append((question["question"], question["options"][picked[0] - 1]["title"]))
-            run.done = len(decided)
+            run.title = f"Перестраиваю диаграммы: {index} из {len(todo)}"
             self._touch()
-        path = self.do_export_md({})["path"]
-        run.summary = f"Разногласий нет, документация записана: {path}" if not decided else \
-            f"{'Автоматически исправлено' if auto else 'Исправлено'} правок: {len(decided)}. Документация записана: {path}"
-
-    FIX_ORDER = {"remove": 0, "choose_variant": 1, "edit": 2, "suggest_variants": 3, "rebuild": 4}
-
-    def _apply_all(self, run: Run, fixes: list[dict], decided: list) -> None:
-        """Автоматический режим: правки по порядку (убрать, выбрать, исправить, предложить, в конце перестроить диаграммы)."""
-        for fix in sorted(fixes, key=lambda f: self.FIX_ORDER[f["do"]]):
             try:
-                title = self.card(fix["id"])["title"]
-            except EngineError:
-                continue                                   # карточку уже убрала предыдущая правка
-            what = {"remove": "Убрано", "choose_variant": "Выбрано решение", "edit": "Исправлено", "suggest_variants": "Новые варианты для",
-                    "rebuild": "Диаграммы перестроены:"}[fix["do"]]
-            try:
-                self._apply_fix(run, fix)
+                self._rebuild(run, self.card(sid))
             except EngineError as error:
-                run.notes.append(f"Не вышло ({what} «{title}»): {error.message}")
-                continue
-            decided.append((f"{what} «{title}»", fix["do"]))
-            run.notes.append(f"{what} «{title}»")
+                run.notes.append(f"Диаграммы не перестроились: {error.message}")
+
+    def _job_export(self, run: Run) -> None:
+        """Независимая проверка графа и файл. Модель-проверяющий читает граф один раз за проход; вопросы и варианты правок строит код.
+        Дальше проходов столько, сколько нужно: пока проход что-то правит, граф проверяется снова; без правок — выгрузка."""
+        sphere = self.need_sphere()
+        auto = run.kind == "export_auto"
+        slot = self._checker_slot(run)
+        seen: set = set()
+        fixed = 0
+        while True:
+            bounds = [str((r["data"] or {}).get("text", ""))[len(flow.BOUNDARY):] for r in self._boundary_records()]
+            found = check.issues(self)
+            run.total = run.done = 0                                      # числа в заголовке — только пока идёт вопрос или правка
+            report = self._checker_turn(run, slot, sphere, bounds, found)
+            if report is None:
+                return
+            items = check.build_items(self, report, bounds, found)
+            signature = tuple(sorted(item["question"] for item in items))
+            if items and signature in seen:
+                raise EngineError("no_progress", "Проверка ходит по кругу: те же разногласия после правок. Разберите их вручную: "
+                                  + "; ".join(i["question"] for i in items[:3]))
+            seen.add(signature)
+            applied = 0
+            run.total = len(items)
+            for number, item in enumerate(items, 1):
+                if run.stop:
+                    return
+                if not all(self._exists(card_id) for card_id in item["cards"]):
+                    continue                                              # карточку уже убрала предыдущая правка
+                pick = item["recommended"] if auto else self._ask_item(run, item, number, len(items))
+                if pick is None:
+                    return
+                option = item["options"][pick - 1]
+                for fix in option["fixes"]:
+                    try:
+                        self._apply_fix(run, fix)
+                    except EngineError as error:
+                        run.notes.append(f"Не вышло ({option['title']}): {error.message}")
+                        break
+                else:
+                    applied += 1
+                    run.notes.append(option["title"])
+                run.status, run.done = "running", number
+                self._touch()
+            fixed += applied
+            if items and not applied:
+                raise EngineError("no_progress", "Правки не применились: " + "; ".join(i["question"] for i in items[:3]))
+            self._fix_diagrams(run)
+            if run.stop:
+                return
+            left = check.issues(self)
+            if not items:
+                if left:
+                    raise EngineError("no_progress", "Остались разногласия: " + "; ".join(i["text"] for i in left[:3]))
+                break
+        path = self.do_export_md({})["path"]
+        run.summary = f"Разногласий нет, документация записана: {path}" if not fixed else             f"{'Автоматически исправлено' if auto else 'Исправлено'} правок: {fixed}. Документация записана: {path}"
 
     def _apply_fix(self, run: Run, fix: dict) -> None:
         do, card_id = fix["do"], fix["id"]

@@ -5,6 +5,7 @@
 
     helper      — помощник: предлагает роли, сценарии, проблемы, варианты решения и строит диаграммы;
     autopilot   — сильная модель: задаёт вопросы о границах системы и сама проходит цепочку;
+    checker     — независимый проверяющий: перед выгрузкой один раз читает граф и ищет разногласия (модель не та, что строит);
     researchers — три исследователя с веб-поиском: ищут и анализируют конкурентов (дайте им разные модели).
 """
 
@@ -18,6 +19,7 @@ from pathlib import Path
 DEFAULTS = {
     "helper": {"agent": "claude", "model": "", "effort": ""},
     "autopilot": {"agent": "claude", "model": "opus", "effort": ""},
+    "checker": {"agent": "claude", "model": "sonnet", "effort": ""},      # независимая проверка перед выгрузкой: другая модель, чем строит
     "researchers": [{"agent": "claude", "model": "opus", "effort": ""},
                     {"agent": "claude", "model": "sonnet", "effort": ""},
                     {"agent": "claude", "model": "haiku", "effort": ""}],
@@ -52,6 +54,8 @@ class Settings:
             self.data["helper"] = _slot(raw["helper"])
         if isinstance(raw.get("autopilot"), dict):
             self.data["autopilot"] = _slot(raw["autopilot"])
+        if isinstance(raw.get("checker"), dict):
+            self.data["checker"] = _slot(raw["checker"])
         if isinstance(raw.get("researchers"), list) and len(raw["researchers"]) == 3:
             self.data["researchers"] = [_slot(x) for x in raw["researchers"]]
         if "projects_root" in raw:

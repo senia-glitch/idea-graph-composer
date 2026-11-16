@@ -68,23 +68,13 @@ PILOT_RULES = """
 CHECK_RULES = """
 # Как ты работаешь
 
-Ты ведущий аналитик и проверяешь согласованность проекта перед выгрузкой документации. Документ — точное отражение графа,
-поэтому все разногласия исправляются в графе, и решает человек. Задача приходит во вводных хода (если их нет — вызови `turn_info`).
+Ты независимый проверяющий: проект строил не ты, защищать его не нужно. Проверь граф и сдай ОДИН отчёт. Задача приходит во вводных
+хода (если их нет — вызови `turn_info`).
 
-Инструменты:
-- `conflict` — один простой вопрос человеку про одно разногласие с 2-4 готовыми вариантами. Вопрос до 120 символов и про одно,
-  варианты до 60 символов, без пояснений. КАЖДЫЙ вариант — это правка графа (поле `fix`); варианта «оставить как есть»
-  быть не должно. После вызова сразу заканчивай ход: ответ придёт в следующем.
-  Виды правок (`fix.do`):
-  `remove` (id — карточка, уходит вместе с тем, что под ней),
-  `choose_variant` (id — вариант решения проблемы: принимается, остальные варианты этой проблемы убираются),
-  `suggest_variants` (id — проблема: помощник предложит новые варианты решения),
-  `edit` (id — карточка; `title`, `body`, `importance` — что переписать; для проблемы importance: низкая/средняя/высокая/критическая),
-  `rebuild` (id — сценарий: диаграммы «как есть» и «как будет» перестраиваются по принятым проблемам и выбранным решениям).
-- `finish` — разногласий больше нет.
-
-Правила: по-русски, коротко, конкретно; в вопросе назови карточки по названию; id бери только из графа в задаче;
-вопросов обычным текстом не задавай; не выдумывай разногласий.
+Инструмент `report` — один вызов: `items` — смысловые разногласия (только виды boundary, duplicate, contradiction; список может быть
+пустым), `answers` — ответы по пунктам, которые нашёл код. Формат и правила — в задаче. Если пакет вернёт ошибку отчёта, исправь
+и вызови `report` снова. Границы системы — жёсткое правило, но придираться и выдумывать нельзя: нет конкретной границы или
+конкретных двух карточек — разногласия нет. Пиши по-русски; id бери только из графа; обычным текстом ничего не пиши.
 """.strip()
 
 _TURN_INFO = {"name": "turn_info", "description": "Вводные текущего хода. Вызови, если их нет в сообщении.",
@@ -149,50 +139,22 @@ BOUNDS_TOOLS = [HELPER_TOOLS[0], HELPER_TOOLS[2], HELPER_TOOLS[3]]            # 
 CHECK_TOOLS = [
     HELPER_TOOLS[0],
     {
-        "name": "conflict",
-        "description": "Задать человеку один вопрос про одно разногласие; у каждого варианта есть правка графа (fix). После вызова заканчивай ход.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "В чём разногласие: один простой вопрос до 120 символов"},
-                "options": {"type": "array", "minItems": 2, "maxItems": 4, "items": {"type": "object", "properties": {
-                    "title": {"type": "string", "description": "Что сделать, до 60 символов"},
-                    "fix": {"type": "object", "description": "Правка: {do: remove|choose_variant|suggest_variants|edit|rebuild, id, title?, body?, importance?}"}},
-                    "required": ["title", "fix"]}},
-                "recommended": {"type": "array", "items": {"type": "integer"}, "description": "Номер рекомендуемого варианта (с 1)"},
-            },
-            "required": ["question", "options"],
-        },
+        "name": "report",
+        "description": "Сдать отчёт проверки: items — смысловые разногласия, answers — ответы по пунктам кода. Один вызов.",
+        "inputSchema": {"type": "object", "properties": {
+            "items": {"type": "array", "items": {"type": "object", "properties": {
+                "kind": {"type": "string", "enum": ["boundary", "duplicate", "contradiction"]},
+                "cards": {"type": "array", "items": {"type": "string"}, "description": "boundary — одна карточка, остальные — две"},
+                "boundary": {"type": "integer", "description": "boundary: номер нарушаемой границы"},
+                "remove": {"type": "string", "description": "duplicate/contradiction: id карточки, которую убрать"},
+                "rewrite": {"type": "object", "description": "boundary, необязательно: {title, body до 250 символов}"}},
+                "required": ["kind", "cards"]}},
+            "answers": {"type": "array", "items": {"type": "object", "properties": {
+                "issue": {"type": "string", "description": "id пункта кода (i1…)"},
+                "pick": {"type": "string", "description": "edit | remove | id варианта | suggest"},
+                "body": {"type": "string"}, "importance": {"type": "string"}}, "required": ["issue", "pick"]}}},
+            "required": ["items", "answers"]},
     },
-    HELPER_TOOLS[3],
-]
-
-AUTO_CHECK_RULES = """
-# Как ты работаешь
-
-Ты ведущий аналитик и проверяешь согласованность проекта перед выгрузкой документации. Человека рядом нет: вопросов не задаёшь,
-правишь граф сам. Задача приходит во вводных хода (если их нет — вызови `turn_info`). Главное правило: всё, что выходит за границы
-системы или спорно, убирается.
-
-Инструменты:
-- `resolve` — один вызов со списком правок `fixes`: `{"do":"remove|choose_variant|suggest_variants|edit|rebuild","id":"…",
-  "title"?,"body"?,"importance"?}` (смысл правок — как в задаче). id бери только из графа. Любая ошибка — отказ всему списку.
-- `finish` — разногласий больше нет (принимается, только если проверка кода тоже ничего не находит).
-
-Правила: по-русски; описание в `edit` — до 250 символов, 1-2 предложения; ничего не выдумывай; обычным текстом ничего не пиши.
-""".strip()
-
-AUTO_CHECK_TOOLS = [
-    HELPER_TOOLS[0],
-    {
-        "name": "resolve",
-        "description": "Исправить граф списком правок. Вызывается один раз за ход; после вызова заканчивай ход.",
-        "inputSchema": {"type": "object", "properties": {"fixes": {"type": "array", "items": {"type": "object", "properties": {
-            "do": {"type": "string", "enum": ["remove", "choose_variant", "suggest_variants", "edit", "rebuild"]},
-            "id": {"type": "string"}, "title": {"type": "string"}, "body": {"type": "string"}, "importance": {"type": "string"}},
-            "required": ["do", "id"]}}}, "required": ["fixes"]},
-    },
-    HELPER_TOOLS[3],
 ]
 
 PILOT_TOOLS = [

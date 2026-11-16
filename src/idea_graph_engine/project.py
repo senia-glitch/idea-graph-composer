@@ -778,8 +778,9 @@ class Project:
             if not title:
                 raise EngineError("bad_title", f"Операция {number}: нужен title")
             parent = ctx["target"] or sphere["id"]
-            if title.lower() in self.rejected(kind) or any(
-                    c["title"].lower() == title.lower() for c in self.cards(kind, parent if ctx["target"] else None)):
+            replaces = kind in (flow.ASIS, flow.SOLUTION)          # диаграмма сценария одна: новая заменяет старую, а не считается дублем
+            if not replaces and (title.lower() in self.rejected(kind) or any(
+                    c["title"].lower() == title.lower() for c in self.cards(kind, parent if ctx["target"] else None))):
                 skipped.append(title)
                 continue
             attrs, links, status = {}, [], PROPOSED

@@ -137,3 +137,25 @@ def test_check_stops_instead_of_looping_when_checker_never_reports(make):
     p.start("export_auto")
     run = wait(p, ("done", "error"))
     assert run.status == "error" and "не сдал отчёт" in run.error
+
+
+def test_rebuild_really_replaces_the_old_diagram(make):
+    """Ошибка из жизни: перестроение пропускалось как «такая карточка уже есть», и диаграмма оставалась устаревшей."""
+    p = make(make_agent())
+    scenario, problem = build_state(p)
+    p.act("choose_variant", {"id": kinds(p, "вариант")[0]["id"]})
+    p.act("remove", {"id": kinds(p, "роль")[1]["id"]})
+    p.start("export_auto")
+    assert wait(p, ("done", "error")).status == "done"
+    old = kinds(p, "как есть")[0]
+    extra = p.act("add_problem", {"scenario": scenario["id"], "title": "Забывают прийти", "body": "бывает", "importance": "средняя"})["id"]
+    p.act("remove", {"id": extra})                                       # проблему добавили и убрали: набор прежний, диаграмма актуальна
+    assert not [i for i in check.issues(p) if i["code"] == "diagram"]
+    p.act("choose_variant", {"id": kinds(p, "вариант")[0]["id"]})
+    p._human([{"op": "update_card", "id": problem, "body": "стало по-другому"}])           # текст проблемы изменился: диаграммы устарели
+    assert [i for i in check.issues(p) if i["code"] == "diagram"]
+    p.start("export_auto")
+    assert wait(p, ("done", "error")).status == "done"
+    new = kinds(p, "как есть")
+    assert len(new) == 1 and new[0]["id"] != old["id"]                    # заменена, а не пропущена и не продублирована
+    assert len(kinds(p, "решение")) == 1 and not [i for i in check.issues(p) if i["code"] == "diagram"]
